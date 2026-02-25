@@ -1,0 +1,9 @@
+[package]
+name = "site-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+toml = "0.8"
+image = { version = "0.25", default-features = false, features = ["webp", "png"] }
+zotero-cite = { git = "https://github.com/EmilLindfors/zotero-cite" }
