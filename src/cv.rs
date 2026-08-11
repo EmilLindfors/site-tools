@@ -14,16 +14,25 @@ pub fn build() -> Result<(), String> {
         return Err(format!("cv.typ not found at {}", root.display()));
     }
 
-    let output_dir = root.join("static/pdf");
-    fs::create_dir_all(&output_dir)
-        .map_err(|e| format!("Failed to create {}: {e}", output_dir.display()))?;
-
-    let output_path = output_dir.join("cv.pdf");
+    // static/cv.pdf, not static/pdf/cv.pdf: the sidebar links /cv.pdf, and nothing
+    // serves /pdf/cv.pdf. Writing there just left an unreferenced stale copy behind.
+    let output_path = root.join("static/cv.pdf");
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
 
     println!("Compiling cv.typ -> {}", output_path.display());
 
+    // cv.typ asks for Libertinus Serif; without this it silently renders in fallback
+    // fonts. --font-path is recursive, so one path covers everything fetch-fonts.sh
+    // installs.
+    let font_path = root.join("fonts");
+
     let status = Command::new("typst")
         .arg("compile")
+        .arg("--font-path")
+        .arg(&font_path)
         .arg(&cv_src)
         .arg(&output_path)
         .status()

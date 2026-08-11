@@ -120,7 +120,7 @@ fn print_usage() {
     eprintln!("  cite process <post-path> [--style ...]  Replace @citekeys with formatted citations");
     eprintln!("  cite list                               List available Zotero citekeys");
     eprintln!("  cite lookup <citekey>                   Show reference details");
-    eprintln!("  cv build                                Compile cv.typ to static/pdf/cv.pdf");
+    eprintln!("  cv build                                Compile cv.typ to static/cv.pdf");
     eprintln!("  newsletter gen <post-path>              Generate newsletter .md from blog post");
     eprintln!("  newsletter send <slug> [--subject ...]  Send newsletter to subscribers");
     eprintln!("  pdf gen <post-path>                     Generate PDF from blog post");
@@ -146,7 +146,7 @@ fn print_cv_usage() {
     eprintln!("site-tools cv — Build CV PDF");
     eprintln!();
     eprintln!("Subcommands:");
-    eprintln!("  build  Compile cv.typ to static/pdf/cv.pdf");
+    eprintln!("  build  Compile cv.typ to static/cv.pdf");
 }
 
 fn print_pdf_usage() {
