@@ -24,9 +24,19 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 .parse()
                 .map_err(|e: String| e)?;
 
-            let db = open_db()?;
             let content =
                 std::fs::read_to_string(&file).map_err(|e| format!("Read {}: {}", file.display(), e))?;
+
+            // A post that documents the citation syntax contains @citekeys inside code
+            // blocks and code spans. The processor is not code-block aware, so running
+            // it over such a post rewrites the examples it is trying to teach -- and
+            // deploy.sh commits and pushes the result. Let a post opt out.
+            if skip_citations(&content) {
+                eprintln!("Skipping {} (extra.skip_citations)", file.display());
+                return Ok(());
+            }
+
+            let db = open_db()?;
 
             let (processed, refs) =
                 process_markdown(&content, &db, cite_style).map_err(|e| e.to_string())?;
@@ -119,4 +129,52 @@ fn print_usage() {
     eprintln!("                              Replace @citekeys with formatted citations");
     eprintln!("  list                        List all available citekeys from Zotero");
     eprintln!("  lookup <citekey>            Show reference details for a citekey");
+}
+
+/// True if the post opts out of citation processing via `extra.skip_citations`.
+///
+/// Frontmatter is optional here: a file without it is simply processed as before.
+fn skip_citations(content: &str) -> bool {
+    let Ok((toml_str, _)) = crate::frontmatter::split(content) else {
+        return false;
+    };
+    let Ok(table) = toml_str.parse::<toml::Table>() else {
+        return false;
+    };
+    table
+        .get("extra")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("skip_citations"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opts_out_when_flag_set() {
+        let src = "+++\ntitle = \"T\"\n\n[extra]\nskip_citations = true\n+++\n\nbody @key\n";
+        assert!(skip_citations(src));
+    }
+
+    #[test]
+    fn processes_by_default() {
+        let src = "+++\ntitle = \"T\"\n+++\n\nbody @key\n";
+        assert!(!skip_citations(src));
+    }
+
+    #[test]
+    fn explicit_false_processes() {
+        let src = "+++\ntitle = \"T\"\n\n[extra]\nskip_citations = false\n+++\n\nbody\n";
+        assert!(!skip_citations(src));
+    }
+
+    /// Never skip because a file is malformed -- that would silently drop real work.
+    #[test]
+    fn malformed_frontmatter_does_not_opt_out() {
+        assert!(!skip_citations("no frontmatter at all"));
+        assert!(!skip_citations("+++\nthis is not = valid = toml\n+++\nbody"));
+    }
 }

@@ -91,6 +91,7 @@ fn run_pdf(args: &[String]) -> Result<(), String> {
             }
             pdf::gen(&args[1])
         }
+        "all" => pdf::gen_all(),
         "-h" | "--help" | "help" => {
             print_pdf_usage();
             Ok(())
@@ -124,6 +125,7 @@ fn print_usage() {
     eprintln!("  newsletter gen <post-path>              Generate newsletter .md from blog post");
     eprintln!("  newsletter send <slug> [--subject ...]  Send newsletter to subscribers");
     eprintln!("  pdf gen <post-path>                     Generate PDF from blog post");
+    eprintln!("  pdf all                                 Generate PDFs for all posts (skips drafts)");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  site-tools cite process content/blog/my-post/index.md");
@@ -153,5 +155,8 @@ fn print_pdf_usage() {
     eprintln!("site-tools pdf — Generate PDFs from blog posts");
     eprintln!();
     eprintln!("Subcommands:");
-    eprintln!("  gen <post-path>  Convert images, preprocess markdown, compile with Typst");
+    eprintln!("  gen <post-path>  Preprocess markdown and compile with Typst");
+    eprintln!("  all              Same, for every post under content/blog/");
+    eprintln!();
+    eprintln!("Drafts are skipped. Set INCLUDE_DRAFTS=1 to generate one anyway.");
 }

@@ -18,6 +18,13 @@ pub fn gen(post_path: &str) -> Result<(), String> {
     let (_, body) = frontmatter::split(&content)?;
     let slug = frontmatter::slug_from_path(path);
 
+    // Drafts are unpublished, but static/pdf/<slug>.pdf is served at a guessable URL,
+    // so generating one would put unpublished writing on the public site.
+    if fm.draft && std::env::var_os("INCLUDE_DRAFTS").is_none() {
+        println!("Skipping draft: {slug}");
+        return Ok(());
+    }
+
     let project_root = crate::util::find_project_root(path)?;
     let post_dir = fs::canonicalize(path)
         .map_err(|e| format!("Failed to resolve {post_path}: {e}"))?;
@@ -28,11 +35,8 @@ pub fn gen(post_path: &str) -> Result<(), String> {
     // Create temp directory
     let temp_dir = tempdir(&slug)?;
 
-    // Copy supported images (PNG, JPEG, GIF, SVG)
-    copy_native_images(post_dir, &temp_dir)?;
-
-    // Convert WebP images to PNG (skip thumbnails)
-    convert_webp_images(post_dir, &temp_dir)?;
+    // Copy images. Typst reads WebP natively, so nothing is converted.
+    copy_images(post_dir, &temp_dir)?;
 
     // Preprocess markdown body
     let processed = preprocess_body(body);
@@ -43,14 +47,8 @@ pub fn gen(post_path: &str) -> Result<(), String> {
     // Format date for display
     let date_display = format_date(&fm.date);
 
-    // Resolve featured image (rewrite .webp -> .png)
-    let featured_image = fm.featured_image.as_deref().map(|img| {
-        if img.ends_with(".webp") {
-            format!("{}.png", &img[..img.len() - 5])
-        } else {
-            img.to_string()
-        }
-    });
+    // Featured image is used as-is; Typst handles WebP.
+    let featured_image = fm.featured_image.clone();
 
     // Check if featured image exists in temp dir
     let use_featured = featured_image
@@ -83,17 +81,25 @@ pub fn gen(post_path: &str) -> Result<(), String> {
 
     let output_path = output_dir.join(format!("{slug}.pdf"));
 
-    let font_inter = project_root.join("fonts/inter");
-    let font_literata = project_root.join("fonts/literata");
+    // One recursive path covers inter, literata, jetbrains-mono and libertinus.
+    // Listing subdirectories individually is how JetBrains Mono and Libertinus Serif
+    // silently fell back to system fonts.
+    let font_path = project_root.join("fonts");
 
-    let status = Command::new("typst")
-        .arg("compile")
+    let mut cmd = Command::new("typst");
+    cmd.arg("compile")
         .arg("--font-path")
-        .arg(&font_inter)
-        .arg("--font-path")
-        .arg(&font_literata)
+        .arg(&font_path)
         .arg(&doc_path)
-        .arg(&output_path)
+        .arg(&output_path);
+
+    // Typst stamps a CreationDate, so an unchanged post would still produce a
+    // different file on every run and dirty the repo. Pin it to the post's own date.
+    if let Some(epoch) = date_to_epoch(&fm.date) {
+        cmd.env("SOURCE_DATE_EPOCH", epoch.to_string());
+    }
+
+    let status = cmd
         .status()
         .map_err(|e| format!("Failed to run typst: {e}"))?;
 
@@ -101,10 +107,42 @@ pub fn gen(post_path: &str) -> Result<(), String> {
         return Err(format!("typst compile failed with status {status}"));
     }
 
-    // Clean up temp dir
-    let _ = fs::remove_dir_all(&temp_dir);
+    // Clean up temp dir. SITE_TOOLS_KEEP_TEMP=1 leaves the generated content.md and
+    // document.typ in place, which is the only way to see what Typst was actually fed.
+    if std::env::var_os("SITE_TOOLS_KEEP_TEMP").is_none() {
+        let _ = fs::remove_dir_all(&temp_dir);
+    } else {
+        println!("  temp kept: {}", temp_dir.display());
+    }
 
     println!("Generated: {}", output_path.display());
+    Ok(())
+}
+
+/// Generate PDFs for every post under content/blog/.
+///
+/// Drafts are skipped by `gen`, so the loop needs no filter of its own.
+pub fn gen_all() -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {e}"))?;
+    let root = crate::util::find_project_root(&cwd)?;
+    let blog = root.join("content/blog");
+
+    let mut posts: Vec<PathBuf> = fs::read_dir(&blog)
+        .map_err(|e| format!("Failed to read {}: {e}", blog.display()))?
+        .flatten()
+        .map(|e| e.path().join("index.md"))
+        .filter(|p| p.is_file())
+        .collect();
+    posts.sort();
+
+    if posts.is_empty() {
+        return Err(format!("No posts found under {}", blog.display()));
+    }
+
+    for post in &posts {
+        gen(&post.to_string_lossy())?;
+    }
+
     Ok(())
 }
 
@@ -120,8 +158,11 @@ fn tempdir(slug: &str) -> Result<PathBuf, String> {
     Ok(base)
 }
 
-/// Copy PNG, JPEG, GIF, SVG files from post directory to temp directory.
-fn copy_native_images(post_dir: &Path, temp_dir: &Path) -> Result<(), String> {
+/// Copy images from the post directory to the temp directory.
+///
+/// Typst reads WebP natively, so there is no conversion step and no ImageMagick or
+/// `image` crate dependency. Thumbnails are for the website, not the PDF.
+fn copy_images(post_dir: &Path, temp_dir: &Path) -> Result<(), String> {
     let entries = fs::read_dir(post_dir)
         .map_err(|e| format!("Failed to read {}: {e}", post_dir.display()))?;
 
@@ -132,61 +173,51 @@ fn copy_native_images(post_dir: &Path, temp_dir: &Path) -> Result<(), String> {
             .and_then(|e| e.to_str())
             .map(|e| e.to_lowercase());
 
-        match ext.as_deref() {
-            Some("png" | "jpg" | "jpeg" | "gif" | "svg") => {
-                let dest = temp_dir.join(path.file_name().unwrap());
-                fs::copy(&path, &dest).map_err(|e| {
-                    format!("Failed to copy {}: {e}", path.display())
-                })?;
-            }
-            _ => {}
+        if !matches!(
+            ext.as_deref(),
+            Some("png" | "jpg" | "jpeg" | "gif" | "svg" | "webp")
+        ) {
+            continue;
         }
+
+        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+        if file_name.contains("-thumb") {
+            continue;
+        }
+
+        fs::copy(&path, temp_dir.join(&file_name))
+            .map_err(|e| format!("Failed to copy {}: {e}", path.display()))?;
     }
 
     Ok(())
 }
 
-/// Convert WebP images to PNG using the `image` crate. Skip thumbnails.
-fn convert_webp_images(post_dir: &Path, temp_dir: &Path) -> Result<(), String> {
-    let entries = fs::read_dir(post_dir)
-        .map_err(|e| format!("Failed to read {}: {e}", post_dir.display()))?;
+/// Convert a `YYYY-MM-DD` date to a Unix timestamp (midnight UTC).
+///
+/// Hand-rolled rather than pulling in a date crate: the only input is a Zola
+/// frontmatter date, and this feeds SOURCE_DATE_EPOCH where any stable value derived
+/// from the post works. Returns None if the date is not parseable.
+fn date_to_epoch(date: &str) -> Option<i64> {
+    let head = date.split(|c| c == 'T' || c == ' ').next()?;
+    let mut parts = head.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase());
-
-        if ext.as_deref() != Some("webp") {
-            continue;
-        }
-
-        let file_name = path.file_name().unwrap().to_string_lossy();
-
-        // Skip thumbnails
-        if file_name.contains("-thumb") {
-            continue;
-        }
-
-        let stem = path.file_stem().unwrap().to_string_lossy();
-        let out_name = format!("{stem}.png");
-
-        match image::open(&path) {
-            Ok(img) => {
-                let out_path = temp_dir.join(&out_name);
-                img.save(&out_path).map_err(|e| {
-                    format!("Failed to save {out_name}: {e}")
-                })?;
-                println!("  Converted {file_name} -> {out_name}");
-            }
-            Err(e) => {
-                eprintln!("  Warning: failed to convert {file_name}: {e}");
-            }
-        }
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
     }
 
-    Ok(())
+    // Days since 1970-01-01, via the civil-from-days algorithm (Howard Hinnant).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    Some(days * 86_400)
 }
 
 /// Preprocess markdown body for Typst compatibility.
@@ -200,9 +231,6 @@ fn preprocess_body(body: &str) -> String {
         }
 
         let mut line = line.to_string();
-
-        // Rewrite .webp image references to .png
-        line = line.replace(".webp)", ".png)");
 
         // Convert citation links [N](#ref-...) to plain text
         line = replace_citation_links(&line);
@@ -349,3 +377,105 @@ fn format_date(date: &str) -> String {
     date.to_string()
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoch_matches_known_dates() {
+        assert_eq!(date_to_epoch("1970-01-01"), Some(0));
+        assert_eq!(date_to_epoch("2000-03-01"), Some(951_868_800));
+        assert_eq!(date_to_epoch("2026-02-25"), Some(1_771_977_600));
+    }
+
+    #[test]
+    fn epoch_ignores_a_time_component() {
+        assert_eq!(date_to_epoch("2026-02-25T13:45:00Z"), date_to_epoch("2026-02-25"));
+    }
+
+    #[test]
+    fn epoch_rejects_junk() {
+        assert_eq!(date_to_epoch(""), None);
+        assert_eq!(date_to_epoch("not-a-date"), None);
+        assert_eq!(date_to_epoch("2026-13-01"), None);
+        assert_eq!(date_to_epoch("2026-01-99"), None);
+    }
+
+    /// The same input must always yield the same timestamp, or PDFs stop being
+    /// reproducible and every build dirties the repo.
+    #[test]
+    fn epoch_is_deterministic() {
+        assert_eq!(date_to_epoch("2026-02-25"), date_to_epoch("2026-02-25"));
+    }
+
+    #[test]
+    fn strips_the_more_separator() {
+        let out = preprocess_body("intro\n<!-- more -->\nrest\n");
+        assert!(!out.contains("<!-- more -->"));
+        assert!(out.contains("intro") && out.contains("rest"));
+    }
+
+    /// WebP references must survive: Typst reads WebP, and rewriting them to .png
+    /// pointed at files that no longer get created.
+    #[test]
+    fn leaves_webp_references_alone() {
+        let out = preprocess_body("![hero](hero.webp)\n");
+        assert!(out.contains("hero.webp"), "got: {out}");
+        assert!(!out.contains(".png"));
+    }
+
+    #[test]
+    fn citation_links_become_plain_text() {
+        assert_eq!(replace_citation_links("see [1](#ref-smith2024) here"), "see 1 here");
+    }
+
+    #[test]
+    fn ordinary_links_are_untouched() {
+        let line = "see [the docs](https://example.com) here";
+        assert_eq!(replace_citation_links(line), line);
+    }
+
+    #[test]
+    fn multiple_citations_on_one_line() {
+        assert_eq!(
+            replace_citation_links("[1](#ref-a) and [2](#ref-b)"),
+            "1 and 2"
+        );
+    }
+
+    #[test]
+    fn unmatched_bracket_is_preserved() {
+        assert_eq!(replace_citation_links("a [ b"), "a [ b");
+    }
+
+    #[test]
+    fn html_reference_becomes_markdown() {
+        let line = r#"<p id="ref-x" class="reference">Smith. <em>Title</em>. <a href="https://doi.org/10.1/2">doi:10.1/2</a></p>"#;
+        let out = convert_html_references(line);
+        assert!(out.starts_with("- "), "got: {out}");
+        assert!(out.contains("*Title*"));
+        assert!(out.contains("[doi:10.1/2](https://doi.org/10.1/2)"));
+        assert!(!out.contains("</p>"));
+    }
+
+    #[test]
+    fn non_reference_html_is_untouched() {
+        let line = "<p>ordinary paragraph</p>";
+        assert_eq!(convert_html_references(line), line);
+    }
+
+    #[test]
+    fn date_display_formatting() {
+        assert_eq!(format_date("2026-02-25"), "February 25, 2026");
+        assert_eq!(format_date("garbage"), "garbage");
+    }
+
+    #[test]
+    fn document_typ_includes_featured_image_only_when_given() {
+        let with = build_document_typ("T", "D", Some("hero.webp"));
+        assert!(with.contains("featured-image: \"hero.webp\""));
+        let without = build_document_typ("T", "D", None);
+        assert!(!without.contains("featured-image"));
+    }
+}
