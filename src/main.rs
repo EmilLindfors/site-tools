@@ -119,6 +119,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  cite process <post-path> [--style ...]  Replace @citekeys with formatted citations");
+    eprintln!("  cite all [--style ...]                  Same, in place, for every post");
     eprintln!("  cite list                               List available Zotero citekeys");
     eprintln!("  cite lookup <citekey>                   Show reference details");
     eprintln!("  cv build                                Compile cv.typ to static/cv.pdf");
@@ -128,6 +129,7 @@ fn print_usage() {
     eprintln!("  pdf all                                 Generate PDFs for all posts (skips drafts)");
     eprintln!();
     eprintln!("Examples:");
+    eprintln!("  site-tools cite all");
     eprintln!("  site-tools cite process content/blog/my-post/index.md");
     eprintln!("  site-tools cite list");
     eprintln!("  site-tools cite lookup @Smith2020");
