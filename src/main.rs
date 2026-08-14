@@ -1,6 +1,7 @@
 mod cite;
 mod cv;
 mod frontmatter;
+mod markdown;
 mod newsletter;
 mod pdf;
 mod util;
@@ -18,6 +19,7 @@ fn main() {
     let result = match args[1].as_str() {
         "cite" => cite::run(&args[2..]),
         "cv" => run_cv(&args[2..]),
+        "markdown" => run_markdown(&args[2..]),
         "newsletter" => run_newsletter(&args[2..]),
         "pdf" => run_pdf(&args[2..]),
         "-h" | "--help" | "help" => {
@@ -59,6 +61,28 @@ fn run_newsletter(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!("Unknown newsletter subcommand: {other}")),
+    }
+}
+
+fn run_markdown(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        print_markdown_usage();
+        process::exit(1);
+    }
+
+    match args[0].as_str() {
+        "gen" => {
+            if args.len() < 2 {
+                return Err("Usage: site-tools markdown gen <post-path>".to_string());
+            }
+            markdown::gen(&args[1])
+        }
+        "all" => markdown::gen_all(),
+        "-h" | "--help" | "help" => {
+            print_markdown_usage();
+            Ok(())
+        }
+        other => Err(format!("Unknown markdown subcommand: {other}")),
     }
 }
 
@@ -123,6 +147,8 @@ fn print_usage() {
     eprintln!("  cite list                               List available Zotero citekeys");
     eprintln!("  cite lookup <citekey>                   Show reference details");
     eprintln!("  cv build                                Compile cv.typ to static/cv.pdf");
+    eprintln!("  markdown gen <post-path>                Generate plain markdown for one post");
+    eprintln!("  markdown all                            Same, for every post (skips drafts)");
     eprintln!("  newsletter gen <post-path>              Generate newsletter .md from blog post");
     eprintln!("  newsletter send <slug> [--subject ...]  Send newsletter to subscribers");
     eprintln!("  pdf gen <post-path>                     Generate PDF from blog post");
@@ -144,6 +170,16 @@ fn print_newsletter_usage() {
     eprintln!("Subcommands:");
     eprintln!("  gen <post-path>              Parse blog post, clean for email, write to static/newsletter/<slug>.md");
     eprintln!("  send <slug> [--subject ...]  Send newsletter via API (reads ADMIN_KEY from .env)");
+}
+
+fn print_markdown_usage() {
+    eprintln!("site-tools markdown — Emit plain markdown for content negotiation");
+    eprintln!();
+    eprintln!("Subcommands:");
+    eprintln!("  gen <post-path>  Write static/blog/<slug>.md for one post");
+    eprintln!("  all              Same, for every post, and prune stale files");
+    eprintln!();
+    eprintln!("Drafts are skipped. Set INCLUDE_DRAFTS=1 to generate one anyway.");
 }
 
 fn print_cv_usage() {

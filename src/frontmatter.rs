@@ -8,6 +8,7 @@ pub struct Frontmatter {
     pub featured_image: Option<String>,
     /// Zola treats a missing `draft` as published.
     pub draft: bool,
+    pub tags: Vec<String>,
 }
 
 /// Split a Zola markdown file on `+++` delimiters.
@@ -72,12 +73,26 @@ pub fn parse(content: &str) -> Result<Frontmatter, String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let tags = table
+        .get("taxonomies")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("tags"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(Frontmatter {
         title,
         date,
         description,
         featured_image,
         draft,
+        tags,
     })
 }
 
