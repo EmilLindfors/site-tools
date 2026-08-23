@@ -1,9 +1,11 @@
+mod audio;
 mod cite;
 mod cv;
 mod frontmatter;
 mod markdown;
 mod newsletter;
 mod pdf;
+mod speech;
 mod util;
 
 use std::{env, process};
@@ -17,11 +19,13 @@ fn main() {
     }
 
     let result = match args[1].as_str() {
+        "audio" => run_audio(&args[2..]),
         "cite" => cite::run(&args[2..]),
         "cv" => run_cv(&args[2..]),
         "markdown" => run_markdown(&args[2..]),
         "newsletter" => run_newsletter(&args[2..]),
         "pdf" => run_pdf(&args[2..]),
+        "speech" => run_speech(&args[2..]),
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -86,6 +90,53 @@ fn run_markdown(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn run_audio(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        print_audio_usage();
+        process::exit(1);
+    }
+
+    let force = args.iter().any(|a| a == "--force");
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+
+    match args[0].as_str() {
+        "gen" => {
+            if args.len() < 2 {
+                return Err("Usage: site-tools audio gen <slug|post-path>".to_string());
+            }
+            audio::gen(&args[1], force, dry_run)
+        }
+        "all" => audio::gen_all(force, dry_run),
+        "-h" | "--help" | "help" => {
+            print_audio_usage();
+            Ok(())
+        }
+        other => Err(format!("Unknown audio subcommand: {other}")),
+    }
+}
+
+fn run_speech(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        print_speech_usage();
+        process::exit(1);
+    }
+
+    match args[0].as_str() {
+        "gen" => {
+            if args.len() < 2 {
+                return Err("Usage: site-tools speech gen <post-path>".to_string());
+            }
+            speech::gen(&args[1])
+        }
+        "all" => speech::gen_all(),
+        "-h" | "--help" | "help" => {
+            print_speech_usage();
+            Ok(())
+        }
+        other => Err(format!("Unknown speech subcommand: {other}")),
+    }
+}
+
 fn run_cv(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         print_cv_usage();
@@ -142,6 +193,8 @@ fn print_usage() {
     eprintln!("Usage: site-tools <command> <subcommand> [options]");
     eprintln!();
     eprintln!("Commands:");
+    eprintln!("  audio gen <slug> [--force]              Synthesise the MP3 for one post");
+    eprintln!("  audio all [--force] [--dry-run]         Same, for every post with a script");
     eprintln!("  cite process <post-path> [--style ...]  Replace @citekeys with formatted citations");
     eprintln!("  cite all [--style ...]                  Same, in place, for every post");
     eprintln!("  cite list                               List available Zotero citekeys");
@@ -153,6 +206,8 @@ fn print_usage() {
     eprintln!("  newsletter send <slug> [--subject ...]  Send newsletter to subscribers");
     eprintln!("  pdf gen <post-path>                     Generate PDF from blog post");
     eprintln!("  pdf all                                 Generate PDFs for all posts (skips drafts)");
+    eprintln!("  speech gen <post-path>                  Write the spoken script for one post");
+    eprintln!("  speech all                              Same, for every post (skips drafts)");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  site-tools cite all");
@@ -178,6 +233,35 @@ fn print_markdown_usage() {
     eprintln!("Subcommands:");
     eprintln!("  gen <post-path>  Write static/blog/<slug>.md for one post");
     eprintln!("  all              Same, for every post, and prune stale files");
+    eprintln!();
+    eprintln!("Drafts are skipped. Set INCLUDE_DRAFTS=1 to generate one anyway.");
+}
+
+fn print_audio_usage() {
+    eprintln!("site-tools audio — Synthesise spoken scripts into committed MP3s");
+    eprintln!();
+    eprintln!("Subcommands:");
+    eprintln!("  gen <slug|post-path>  Synthesise static/audio/<slug>.mp3");
+    eprintln!("  all                   Same, for every script under static/speech/");
+    eprintln!();
+    eprintln!("Flags:");
+    eprintln!("  --force    Regenerate even when the script is unchanged");
+    eprintln!("  --dry-run  Report what would be synthesised, and how many characters");
+    eprintln!();
+    eprintln!("Reads TTS_BACKEND, TTS_BASE_URL, TTS_API_KEY, TTS_MODEL and TTS_VOICE from");
+    eprintln!("the environment, falling back to .env. Needs curl and ffmpeg on PATH.");
+    eprintln!("A post is only re-synthesised when its script changes.");
+}
+
+fn print_speech_usage() {
+    eprintln!("site-tools speech — Derive spoken scripts for text-to-speech");
+    eprintln!();
+    eprintln!("Subcommands:");
+    eprintln!("  gen <post-path>  Write static/speech/<slug>.txt for one post");
+    eprintln!("  all              Same, for every post, and prune stale scripts");
+    eprintln!();
+    eprintln!("Code, tables and the reference list become spoken markers. Pronunciation");
+    eprintln!("overrides go in speech-lexicon.toml at the project root.");
     eprintln!();
     eprintln!("Drafts are skipped. Set INCLUDE_DRAFTS=1 to generate one anyway.");
 }
