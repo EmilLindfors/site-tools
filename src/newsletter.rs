@@ -158,7 +158,12 @@ pub fn send(slug: &str, subject: Option<&str>) -> Result<(), String> {
 
     let output = Command::new("curl")
         .args([
-            "-s", "-X", "POST",
+            // --fail-with-body, not bare -s. `curl -s` exits 0 on an HTTP 500, so a
+            // send that the Worker rejected outright was reported here as success --
+            // and now that a send can *partially* fail (the Worker answers 502 with
+            // the addresses it could not reach), silently exiting 0 would hide the
+            // one case that most needs a human. This still prints the body.
+            "-s", "--fail-with-body", "-X", "POST",
             &format!("{SITE_URL}/api/send-newsletter"),
             "-H", &format!("Authorization: Bearer {admin_key}"),
             "-H", "Content-Type: application/json",
