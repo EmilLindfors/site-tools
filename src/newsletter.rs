@@ -80,11 +80,16 @@ pub fn gen(post_path: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to read {post_path}: {e}"))?;
 
     let fm = frontmatter::parse(&content)?;
-    let (_, body) = frontmatter::split(&content)?;
+    let (toml_str, body) = frontmatter::split(&content)?;
     let slug = frontmatter::slug_from_path(path);
     let post_url = format!("{SITE_URL}/blog/{slug}/");
 
-    let cleaned = clean_body(body);
+    // Same treatment the PDF and the plain-markdown copy already get. An inline citation
+    // is an `<a href="#ref-...">`, and an email has no reference list to jump to — so
+    // without this the reader gets "Christiansen & Jakobsen (2017)" as a link to nowhere
+    // and no way to find out what it refers to.
+    let cleaned = crate::bib::strip_citation_anchors(&clean_body(body));
+    let references = crate::bib::references_markdown(toml_str);
 
     // Build output
     let mut output = String::new();
@@ -95,6 +100,11 @@ pub fn gen(post_path: &str) -> Result<(), String> {
     output.push_str(&format!("url: \"{post_url}\"\n"));
     output.push_str("---\n");
     output.push_str(&cleaned);
+
+    if let Some(references) = &references {
+        output.push('\n');
+        output.push_str(references);
+    }
 
     // Append footer with link to full post
     output.push_str("\n---\n\n");
