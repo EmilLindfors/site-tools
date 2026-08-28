@@ -6,40 +6,93 @@ const THUMB_WIDTH: u32 = 600;
 const THUMB_QUALITY: f32 = 75.0;
 const THUMB_SUFFIX: &str = "-thumb";
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+/// What the command line asked for.
+#[derive(Debug, PartialEq)]
+struct Args {
+    paths: Vec<PathBuf>,
+    max_width: u32,
+    quality: f32,
+    thumbnails: bool,
+    help: bool,
+}
 
-    let mut paths = Vec::new();
-    let mut max_width: u32 = 1200;
-    let mut quality: f32 = 80.0;
-    let mut thumbnails = false;
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            paths: Vec::new(),
+            max_width: 1200,
+            quality: 80.0,
+            thumbnails: false,
+            help: false,
+        }
+    }
+}
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
+/// Parse argv, everything after the program name.
+///
+/// A flag whose value is missing or unparseable is an error rather than a panic: `-q`
+/// at the end of the line used to index past the end of argv.
+fn parse_args(argv: &[String]) -> Result<Args, String> {
+    let mut args = Args::default();
+    let mut it = argv.iter();
+
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
             "-w" | "--max-width" => {
-                i += 1;
-                max_width = args[i].parse().expect("invalid max-width");
+                args.max_width = value_of(&mut it, arg)?
+                    .parse()
+                    .map_err(|_| format!("{arg} wants a width in pixels"))?;
             }
             "-q" | "--quality" => {
-                i += 1;
-                quality = args[i].parse().expect("invalid quality (0-100)");
+                let quality: f32 = value_of(&mut it, arg)?
+                    .parse()
+                    .map_err(|_| format!("{arg} wants a number from 0 to 100"))?;
+                if !(0.0..=100.0).contains(&quality) {
+                    return Err(format!("{arg} wants a number from 0 to 100, not {quality}"));
+                }
+                args.quality = quality;
             }
-            "-t" | "--thumbnails" => {
-                thumbnails = true;
-            }
-            "-h" | "--help" => {
-                print_usage();
-                return;
-            }
-            arg if arg.starts_with('-') => {
-                eprintln!("Unknown flag: {arg}");
-                process::exit(1);
-            }
-            _ => paths.push(PathBuf::from(&args[i])),
+            "-t" | "--thumbnails" => args.thumbnails = true,
+            "-h" | "--help" => args.help = true,
+            other if other.starts_with('-') => return Err(format!("Unknown flag: {other}")),
+            path => args.paths.push(PathBuf::from(path)),
         }
-        i += 1;
     }
+
+    Ok(args)
+}
+
+fn value_of<'a>(
+    it: &mut impl Iterator<Item = &'a String>,
+    flag: &str,
+) -> Result<&'a String, String> {
+    it.next().ok_or_else(|| format!("{flag} needs a value"))
+}
+
+fn main() {
+    let argv: Vec<String> = env::args().skip(1).collect();
+
+    let args = match parse_args(&argv) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            process::exit(1);
+        }
+    };
+
+    if args.help {
+        print_usage();
+        return;
+    }
+
+    let Args {
+        paths,
+        max_width,
+        quality,
+        thumbnails,
+        ..
+    } = args;
 
     if paths.is_empty() {
         print_usage();
@@ -322,4 +375,157 @@ fn print_usage() {
     eprintln!("  img-optim -t content/blog/my-post/hero.jpg");
     eprintln!("  img-optim content/blog/my-post/demo.gif");
     eprintln!("  img-optim -q 90 -w 1600 photo.png");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn defaults_match_what_the_help_promises() {
+        let args = parse_args(&argv(&["hero.jpg"])).unwrap();
+        assert_eq!(args.max_width, 1200);
+        assert_eq!(args.quality, 80.0);
+        assert!(!args.thumbnails);
+        assert_eq!(args.paths, vec![PathBuf::from("hero.jpg")]);
+    }
+
+    #[test]
+    fn flags_and_paths_can_be_interleaved() {
+        let args = parse_args(&argv(&["-t", "a.jpg", "-q", "90", "b.png", "--max-width", "1600"]))
+            .unwrap();
+        assert!(args.thumbnails);
+        assert_eq!(args.quality, 90.0);
+        assert_eq!(args.max_width, 1600);
+        assert_eq!(args.paths, vec![PathBuf::from("a.jpg"), PathBuf::from("b.png")]);
+    }
+
+    /// `img-optim -q` used to index past the end of argv and panic.
+    #[test]
+    fn a_flag_without_its_value_is_an_error() {
+        assert!(parse_args(&argv(&["-q"])).is_err());
+        assert!(parse_args(&argv(&["hero.jpg", "--max-width"])).is_err());
+    }
+
+    #[test]
+    fn a_bad_value_is_an_error() {
+        assert!(parse_args(&argv(&["-q", "high"])).is_err());
+        assert!(parse_args(&argv(&["-w", "wide"])).is_err());
+    }
+
+    /// libwebp reads quality as 0-100 and clamps silently, so a typo like `-q 900`
+    /// would encode at 100 and look like it worked.
+    #[test]
+    fn quality_is_bounded() {
+        assert!(parse_args(&argv(&["-q", "900"])).is_err());
+        assert!(parse_args(&argv(&["-q", "-1"])).is_err());
+        assert_eq!(parse_args(&argv(&["-q", "0"])).unwrap().quality, 0.0);
+        assert_eq!(parse_args(&argv(&["-q", "100"])).unwrap().quality, 100.0);
+    }
+
+    #[test]
+    fn unknown_flags_are_refused() {
+        assert!(parse_args(&argv(&["--lossless", "a.jpg"])).is_err());
+    }
+
+    #[test]
+    fn help_wins_before_any_path_is_needed() {
+        assert!(parse_args(&argv(&["--help"])).unwrap().help);
+        assert!(parse_args(&argv(&["-h"])).unwrap().help);
+    }
+
+    #[test]
+    fn only_raster_sources_convert() {
+        for name in ["a.jpg", "a.JPEG", "a.png", "a.gif", "a.bmp", "a.tiff", "a.tif"] {
+            assert!(is_convertible(Path::new(name)), "{name} should convert");
+        }
+        // Already converted, or not a raster image at all.
+        for name in ["a.webp", "a.svg", "index.md", "a", "a.WEBP"] {
+            assert!(!is_convertible(Path::new(name)), "{name} should not convert");
+        }
+    }
+
+    /// The template derives the thumbnail path from `featured_image` with a string
+    /// replace, so `hero.jpg` has to produce exactly `hero.webp` and `hero-thumb.webp`.
+    #[test]
+    fn output_names_follow_the_template_convention() {
+        let src = Path::new("content/blog/my-post/hero.jpg");
+        assert_eq!(
+            src.with_extension("webp"),
+            Path::new("content/blog/my-post/hero.webp")
+        );
+        let stem = src.file_stem().unwrap().to_string_lossy();
+        assert_eq!(
+            src.with_file_name(format!("{stem}{THUMB_SUFFIX}.webp")),
+            Path::new("content/blog/my-post/hero-thumb.webp")
+        );
+    }
+
+    /// An image already inside the cap is left alone rather than resampled, which would
+    /// cost quality for no bytes saved.
+    #[test]
+    fn resize_only_shrinks() {
+        let wide = image::DynamicImage::new_rgba8(2400, 1200);
+        let out = resize_to_width(wide, 1200);
+        assert_eq!(out.dimensions(), (1200, 600));
+
+        let narrow = image::DynamicImage::new_rgba8(800, 400);
+        let out = resize_to_width(narrow, 1200);
+        assert_eq!(out.dimensions(), (800, 400));
+
+        let exact = image::DynamicImage::new_rgba8(1200, 300);
+        let out = resize_to_width(exact, 1200);
+        assert_eq!(out.dimensions(), (1200, 300));
+    }
+
+    #[test]
+    fn sizes_read_in_the_unit_that_fits() {
+        assert_eq!(fmt_size(512), "512 B");
+        assert_eq!(fmt_size(1024), "1.0 KB");
+        assert_eq!(fmt_size(48_845), "47.7 KB");
+        assert_eq!(fmt_size(4 * 1024 * 1024), "4.0 MB");
+    }
+
+    /// A directory argument picks up its convertible files and nothing else, sorted so
+    /// the run reads the same twice.
+    #[test]
+    fn a_directory_yields_its_convertible_files() {
+        let dir = std::env::temp_dir().join("img-optim-collect-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for name in ["b.png", "a.jpg", "hero.webp", "index.md", "chart.svg"] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        let files = collect_files(&[dir.clone()]);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.jpg", "b.png"]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A named file that is not a raster source is skipped rather than erroring, so
+    /// `img-optim post-dir/*` does the right thing with a mixed glob.
+    #[test]
+    fn unconvertible_paths_are_skipped() {
+        assert!(collect_files(&[PathBuf::from("index.md")]).is_empty());
+        assert!(collect_files(&[PathBuf::from("hero.webp")]).is_empty());
+    }
+
+    /// Collection is by extension alone. A missing file is still collected, and reported
+    /// per-file when it fails to open -- which is the right place to say so, since the
+    /// path came from the command line.
+    #[test]
+    fn a_missing_source_is_collected_and_fails_later() {
+        let missing = PathBuf::from("does-not-exist.jpg");
+        assert_eq!(collect_files(&[missing.clone()]), vec![missing.clone()]);
+        assert!(optimize(&missing, 1200, 80.0).is_err());
+    }
 }
