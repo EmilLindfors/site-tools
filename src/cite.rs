@@ -1,8 +1,21 @@
+//! Resolve the citation markers in a post and store what they resolved to.
+//!
+//! A post is written with `@key` and `[@key]` markers (see `markers`). This resolves
+//! each against crossref or a local Zotero library (see `sources`), rewrites the marker
+//! into a linked citation, and appends the reference record to the post's own
+//! frontmatter as `[[extra.references]]`, which is what `templates/components.html`
+//! renders.
+//!
+//! Storing the record in the post is what makes the pipeline offline: after the first
+//! run there are no markers left to resolve, so a build touches neither the network nor
+//! a Zotero database, and the reference cannot drift from the post citing it.
+
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use zotero_cite::{
-    CitationStyle, ZoteroDb, default_bbt_db, default_zotero_db, format_references_section,
-    process_markdown,
-};
+
+use crate::bib::Reference;
+use crate::markers::Marker;
+use crate::sources::{Resolver, Source};
 
 pub fn run(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
@@ -13,78 +26,66 @@ pub fn run(args: &[String]) -> Result<(), String> {
     match args[0].as_str() {
         "process" => {
             if args.len() < 2 {
-                return Err("Usage: site-tools cite process <post-path> [--style apa|numeric|numeric-link] [--output <path>]".to_string());
+                return Err("Usage: site-tools cite process <post-path> [--source auto|crossref|zotero] [--output <path>]".to_string());
             }
             let file = PathBuf::from(&args[1]);
-            let cite_style = parse_style(&args[2..])?;
+            let source = parse_source(&args[2..])?;
             let output = super::parse_flag(&args[2..], "--output").map(PathBuf::from);
 
-            let content =
-                std::fs::read_to_string(&file).map_err(|e| format!("Read {}: {}", file.display(), e))?;
+            let content = std::fs::read_to_string(&file)
+                .map_err(|e| format!("Read {}: {}", file.display(), e))?;
 
-            // A post that documents the citation syntax contains @citekeys inside code
-            // blocks and code spans. The processor is not code-block aware, so running
-            // it over such a post rewrites the examples it is trying to teach -- and
-            // deploy.sh commits and pushes the result. Let a post opt out.
+            // The mask hides code and frontmatter from the marker scanner, so a post
+            // documenting the `@key` syntax no longer needs to opt out. The flag stays
+            // as an escape hatch for a post the mask cannot cover.
             if skip_citations(&content) {
                 eprintln!("Skipping {} (extra.skip_citations)", file.display());
                 return Ok(());
             }
 
-            let db = open_db()?;
-            let (final_content, n_refs) = render(&content, &db, cite_style)?;
+            let mut resolver = Resolver::new(source);
+            let (final_content, n_refs) = render(&content, &mut resolver, "post")?;
 
             if let Some(out_path) = output {
                 std::fs::write(&out_path, &final_content)
                     .map_err(|e| format!("Write {}: {}", out_path.display(), e))?;
-                eprintln!(
-                    "Processed {n_refs} citations, wrote to {}",
-                    out_path.display()
-                );
+                eprintln!("Resolved {n_refs} citations, wrote to {}", out_path.display());
             } else {
                 print!("{}", final_content);
             }
             Ok(())
         }
-        "all" => process_all(parse_style(&args[1..])?),
+        "all" => process_all(parse_source(&args[1..])?),
         "list" => {
-            let db = open_db()?;
-            let citekeys = db.list_citekeys().map_err(|e| e.to_string())?;
+            let library = open_zotero()?;
+            let citekeys = library.citekeys()?;
             println!("Available citekeys ({}):\n", citekeys.len());
-            for (citekey, item_key) in citekeys {
-                println!("  @{:<40} [{}]", citekey, item_key);
+            for (citekey, title) in citekeys {
+                let title: String = title.chars().take(60).collect();
+                println!("  @{citekey:<44} {title}");
             }
             Ok(())
         }
         "lookup" => {
             if args.len() < 2 {
-                return Err("Usage: site-tools cite lookup <citekey>".to_string());
+                return Err("Usage: site-tools cite lookup <citekey|doi>".to_string());
             }
             let key = args[1].trim_start_matches('@');
-            let db = open_db()?;
-            let ref_data = db.lookup(key).map_err(|e| e.to_string())?;
+            let mut resolver = Resolver::new(parse_source(&args[2..])?);
+            let reference = resolver.resolve(key, None)?;
 
-            println!("Citekey: @{}", ref_data.citekey);
-            println!("Type: {}", ref_data.item_type);
-            println!("Title: {}", ref_data.title);
-            println!(
-                "Authors: {}",
-                ref_data
-                    .authors
-                    .iter()
-                    .map(|a| format!("{} {}", a.first_name, a.last_name))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            println!("Year: {}", ref_data.year);
-            if !ref_data.journal.is_empty() {
-                println!("Journal: {}", ref_data.journal);
+            println!("Key:      {}", reference.key);
+            println!("Type:     {}", reference.kind);
+            println!("Authors:  {}", reference.author);
+            println!("Title:    {}", reference.title);
+            println!("Year:     {}", reference.year);
+            if let Some(journal) = &reference.journal {
+                println!("Journal:  {journal}");
             }
-            if !ref_data.doi.is_empty() {
-                println!("DOI: {}", ref_data.doi);
+            if let Some(doi) = &reference.doi {
+                println!("DOI:      {doi}");
             }
-            println!("\nFull reference:\n{}", ref_data.full_reference());
-            println!("\nTOML:\n{}", ref_data.to_toml());
+            println!("\nFrontmatter:\n{}", reference.to_toml_block());
             Ok(())
         }
         "-h" | "--help" | "help" => {
@@ -95,45 +96,166 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn open_db() -> Result<ZoteroDb, String> {
-    ZoteroDb::open(&default_zotero_db(), &default_bbt_db()).map_err(|e| {
-        format!(
-            "Failed to open Zotero databases: {e}\n\
-             Hint: set ZOTERO_DATA_DIR to your Zotero data directory"
-        )
-    })
+fn open_zotero() -> Result<crate::zotero::Library, String> {
+    crate::zotero::Library::open(&crate::zotero::default_data_dir())
+        .map_err(|e| format!("{e}\nHint: set ZOTERO_DATA_DIR to your Zotero data directory"))
 }
 
-fn parse_style(args: &[String]) -> Result<CitationStyle, String> {
-    super::parse_flag(args, "--style")
-        .unwrap_or_else(|| "apa".to_string())
+fn parse_source(args: &[String]) -> Result<Source, String> {
+    super::parse_flag(args, "--source")
+        .unwrap_or_else(|| "auto".to_string())
         .parse()
-        .map_err(|e: String| e)
 }
 
-/// Replace citekeys and append a References section. Returns (content, citation count).
-fn render(
-    content: &str,
-    db: &ZoteroDb,
-    style: CitationStyle,
-) -> Result<(String, usize), String> {
-    let (processed, refs) = process_markdown(content, db, style).map_err(|e| e.to_string())?;
+/// Resolve every marker in one post. Returns (content, count of references stored).
+///
+/// `label` names the post in warnings, which are the only output on the happy path.
+fn render(content: &str, resolver: &mut Resolver, label: &str) -> Result<(String, usize), String> {
+    let (masked, spans) = crate::codemask::mask(content);
+    let markers = crate::markers::scan(&masked);
 
-    let out = if !refs.is_empty() && !processed.contains("## References") {
-        format!("{processed}{}", format_references_section(&refs, style))
+    for doi in crate::markers::unbracketed_dois(&masked, &markers) {
+        eprintln!(
+            "  {label}: @{doi} looks like a DOI. Write it as [@{}] -- a bare one cannot \
+             tell where it ends.",
+            doi.trim_end_matches(['.', ',', ';', ':'])
+        );
+    }
+
+    let (toml_str, _) = crate::frontmatter::split(content)?;
+    let bib = crate::frontmatter::bib_map(toml_str);
+    // File order, kept: an existing reference list is put back the way the post has it.
+    let previous = crate::bib::existing(toml_str);
+    let order: Vec<String> = previous.iter().map(|r| r.key.clone()).collect();
+    let mut stored: BTreeMap<String, Reference> = previous
+        .into_iter()
+        .map(|r| (r.key.clone(), r))
+        .collect();
+
+    let mut resolved: BTreeMap<String, Reference> = BTreeMap::new();
+    let mut fresh: Vec<String> = Vec::new();
+
+    for key in markers.iter().flat_map(|m| m.keys.iter()) {
+        if resolved.contains_key(key) {
+            continue;
+        }
+        let anchor = anchor_of(key);
+
+        // Already in the post's frontmatter from an earlier run: no lookup, no network.
+        if let Some(hit) = stored.get(&anchor) {
+            resolved.insert(key.clone(), hit.clone());
+            continue;
+        }
+
+        match resolver.resolve(key, bib.get(key).map(String::as_str)) {
+            Ok(reference) => {
+                fresh.push(anchor.clone());
+                stored.insert(anchor, reference.clone());
+                resolved.insert(key.clone(), reference);
+            }
+            // An unresolved key is left in the text as written, so it shows up in the
+            // rendered post rather than vanishing into a silently missing citation.
+            Err(e) => eprintln!("  {label}: {e}"),
+        }
+    }
+
+    let rewritten = crate::markers::apply(&masked, &markers, |m| inline(m, &resolved));
+    let content = crate::codemask::unmask(&rewritten, &spans);
+
+    // Existing references keep their order; newly resolved ones follow in the order they
+    // were first cited. Anything else would reshuffle a published post's reference list
+    // every time one more citation is added to it.
+    let ordered: Vec<Reference> = order
+        .iter()
+        .chain(fresh.iter())
+        .filter_map(|k| stored.get(k).cloned())
+        .collect();
+
+    let n = ordered.len();
+    Ok((set_references(&content, &ordered)?, n))
+}
+
+/// The rendered citation for one marker, or `None` if a key in it did not resolve.
+fn inline(marker: &Marker, resolved: &BTreeMap<String, Reference>) -> Option<String> {
+    let refs: Vec<&Reference> = marker
+        .keys
+        .iter()
+        .map(|k| resolved.get(k))
+        .collect::<Option<Vec<_>>>()?;
+
+    if marker.narrative {
+        // A narrative group would read "Smith (2020)Jones (2019)". One key only.
+        return refs.first().map(|r| r.narrative());
+    }
+
+    Some(format!(
+        "({})",
+        refs.iter()
+            .map(|r| r.parenthetical())
+            .collect::<Vec<_>>()
+            .join("; ")
+    ))
+}
+
+fn anchor_of(key: &str) -> String {
+    if crate::bib::is_doi(key) {
+        crate::bib::anchor_for_doi(key)
     } else {
-        processed
+        key.to_string()
+    }
+}
+
+/// Rewrite the `[[extra.references]]` tail of the frontmatter.
+///
+/// The tool owns the frontmatter from the first `[[extra.references]]` line onward and
+/// nothing else, so everything the author wrote comes back byte for byte. That is also
+/// why the blocks go last: an array of tables captures every bare key after it, so a key
+/// written below one would silently become part of a reference.
+fn set_references(content: &str, refs: &[Reference]) -> Result<String, String> {
+    let (start, end) =
+        crate::frontmatter::bounds(content).ok_or("Missing +++ frontmatter delimiters")?;
+
+    let head = &content[start..end];
+    let previous = head.find("[[extra.references]]");
+
+    // A post that cites nothing and has no block to replace is not this tool's to
+    // rewrite. Without this it would still be written back, because trimming the
+    // frontmatter's tail is a change even when nothing else is.
+    if refs.is_empty() && previous.is_none() {
+        return Ok(content.to_string());
+    }
+
+    let kept = match previous {
+        Some(i) => &head[..i],
+        None => head,
     };
 
-    Ok((out, refs.len()))
+    let mut block = String::new();
+    for reference in refs {
+        block.push('\n');
+        block.push_str(&reference.to_toml_block());
+    }
+
+    // Blocks are written with `\n`; a CRLF post keeps CRLF, or `git status` reports
+    // every post the tool has touched as modified when nothing in it changed.
+    let eol = if content.contains("\r\n") {
+        block = block.replace('\n', "\r\n");
+        "\r\n"
+    } else {
+        "\n"
+    };
+
+    let mut out = String::with_capacity(content.len());
+    out.push_str(&content[..start]);
+    out.push_str(kept.trim_end());
+    out.push_str(eol);
+    out.push_str(&block);
+    out.push_str(&content[end..]);
+    Ok(out)
 }
 
-/// Process citations in every post under `content/blog/`, in place.
-///
-/// This is the loop `build.sh` and `deploy.sh` each used to carry a copy of. Doing it
-/// here means one Zotero connection for the whole run instead of one per post, and the
-/// `extra.skip_citations` opt-out is applied in the same place it is defined.
-pub fn process_all(style: CitationStyle) -> Result<(), String> {
+/// Resolve citations in every post under `content/blog/`, in place.
+pub fn process_all(source: Source) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {e}"))?;
     let root = crate::util::find_project_root(&cwd)?;
     let blog = root.join("content/blog");
@@ -146,8 +268,9 @@ pub fn process_all(style: CitationStyle) -> Result<(), String> {
         .collect();
     posts.sort();
 
-    // Read and filter before touching Zotero: a run over posts that cite nothing should
-    // not need a Zotero library to be installed at all.
+    // Read, mask and scan before opening anything: a run over posts whose citations are
+    // already resolved needs no network and no Zotero library at all, which after the
+    // first run is every run.
     let mut pending: Vec<(PathBuf, String)> = Vec::new();
     for post in posts {
         let content = std::fs::read_to_string(&post)
@@ -158,23 +281,24 @@ pub fn process_all(style: CitationStyle) -> Result<(), String> {
             println!("Skipping {slug} (extra.skip_citations)");
             continue;
         }
-        if !has_citekeys(&content) {
+        let (masked, _) = crate::codemask::mask(&content);
+        let markers = crate::markers::scan(&masked);
+        if markers.is_empty() && crate::markers::unbracketed_dois(&masked, &markers).is_empty() {
             continue;
         }
         pending.push((post, content));
     }
 
     if pending.is_empty() {
-        println!("No posts with citations to process.");
+        println!("No unresolved citations.");
         return Ok(());
     }
 
-    let db = open_db()?;
+    let mut resolver = Resolver::new(source);
 
     for (post, content) in pending {
         let slug = crate::frontmatter::slug_from_path(&post);
-        let (rendered, n_refs) = render(&content, &db, style)
-            .map_err(|e| format!("{slug}: {e}"))?;
+        let (rendered, n_refs) = render(&content, &mut resolver, &slug)?;
 
         // Only write on a real change. deploy.sh runs `git add -A`, so rewriting an
         // identical file would still be a no-op there, but leaving mtimes alone keeps
@@ -185,35 +309,38 @@ pub fn process_all(style: CitationStyle) -> Result<(), String> {
 
         std::fs::write(&post, &rendered)
             .map_err(|e| format!("Write {}: {e}", post.display()))?;
-        println!("  {slug}: {n_refs} citations");
+        println!("  {slug}: {n_refs} references");
     }
 
     Ok(())
 }
 
-/// True if the text plausibly contains a `@citekey`.
-///
-/// A cheap pre-filter so posts that cite nothing never open the Zotero database. The
-/// `@` must start a word, which keeps email addresses (`emil@lindfors.no`) out; a false
-/// positive only costs a no-op pass through the processor.
-fn has_citekeys(content: &str) -> bool {
-    let bytes = content.as_bytes();
-    bytes.iter().enumerate().any(|(i, &b)| {
-        b == b'@'
-            && bytes.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic())
-            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-    })
-}
-
 fn print_usage() {
-    eprintln!("site-tools cite — Process Zotero citations in blog posts");
+    eprintln!("site-tools cite — Resolve citation markers in blog posts");
+    eprintln!();
+    eprintln!("Markers:");
+    eprintln!("  @Christiansen2017            narrative: the citation carries the sentence");
+    eprintln!("  [@Christiansen2017]          parenthetical; join several with `;`");
+    eprintln!("  [@10.1016/j.marpol...]       a DOI, which must be bracketed");
+    eprintln!();
+    eprintln!("A key that is not a DOI is looked up in the post's [extra.bib] map, and");
+    eprintln!("failing that in a local Zotero library. Resolved references are written to");
+    eprintln!("the post's frontmatter as [[extra.references]], so later builds need neither.");
     eprintln!();
     eprintln!("Subcommands:");
-    eprintln!("  process <post-path> [--style apa|numeric|numeric-link] [--output <path>]");
-    eprintln!("                              Replace @citekeys with formatted citations");
-    eprintln!("  all [--style ...]           Same, in place, for every post under content/blog/");
+    eprintln!("  process <post-path> [--source ...] [--output <path>]");
+    eprintln!("                              Resolve one post");
+    eprintln!("  all [--source ...]          Same, in place, for every post under content/blog/");
     eprintln!("  list                        List all available citekeys from Zotero");
-    eprintln!("  lookup <citekey>            Show reference details for a citekey");
+    eprintln!("  lookup <citekey|doi>        Show what a marker resolves to");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --source auto|crossref|zotero   auto routes on the marker's shape (default)");
+    eprintln!();
+    eprintln!("Environment:");
+    eprintln!("  CROSSREF_POLITE  an email address, which moves crossref requests into its");
+    eprintln!("                   polite pool (3 req/s rather than 1)");
+    eprintln!("  ZOTERO_DATA_DIR  the Zotero data directory, for citekeys that are not DOIs");
 }
 
 /// True if the post opts out of citation processing via `extra.skip_citations`.
@@ -237,6 +364,19 @@ fn skip_citations(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference(key: &str, family: &str, year: &str) -> Reference {
+        Reference {
+            key: key.into(),
+            kind: "article".into(),
+            author: format!("{family}, J."),
+            title: "A title".into(),
+            year: year.into(),
+            journal: Some("A journal".into()),
+            families: vec![family.into()],
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn opts_out_when_flag_set() {
@@ -264,36 +404,116 @@ mod tests {
     }
 
     #[test]
-    fn detects_a_citekey() {
-        assert!(has_citekeys("as shown by @Smith2020, this holds"));
-        assert!(has_citekeys("[@Smith2020]"));
-        assert!(has_citekeys("@Smith2020 at the very start"));
+    fn narrative_renders_one_citation() {
+        let mut resolved = BTreeMap::new();
+        resolved.insert(
+            "Smith2020".to_string(),
+            reference("Smith2020", "Smith", "2020"),
+        );
+        let marker = Marker {
+            start: 0,
+            end: 0,
+            keys: vec!["Smith2020".into()],
+            narrative: true,
+        };
+        assert_eq!(
+            inline(&marker, &resolved).unwrap(),
+            r##"Smith (<a href="#ref-Smith2020">2020</a>)"##
+        );
     }
 
-    /// The pre-filter exists to avoid opening Zotero for posts that cite nothing.
-    /// An email address is the case that made the old `grep '@[a-zA-Z]'` fire uselessly.
     #[test]
-    fn ignores_email_addresses() {
-        assert!(!has_citekeys("write to emil@lindfors.no for details"));
+    fn a_bracketed_group_joins_with_semicolons() {
+        let mut resolved = BTreeMap::new();
+        resolved.insert("a".to_string(), reference("a", "Smith", "2020"));
+        resolved.insert("b".to_string(), reference("b", "Jones", "2019"));
+        let marker = Marker {
+            start: 0,
+            end: 0,
+            keys: vec!["a".into(), "b".into()],
+            narrative: false,
+        };
+        assert_eq!(
+            inline(&marker, &resolved).unwrap(),
+            r##"(Smith, <a href="#ref-a">2020</a>; Jones, <a href="#ref-b">2019</a>)"##
+        );
+    }
+
+    /// One unresolved key in a group leaves the whole marker as written, rather than
+    /// rendering half a citation.
+    #[test]
+    fn a_group_with_an_unknown_key_renders_nothing() {
+        let mut resolved = BTreeMap::new();
+        resolved.insert("a".to_string(), reference("a", "Smith", "2020"));
+        let marker = Marker {
+            start: 0,
+            end: 0,
+            keys: vec!["a".into(), "missing".into()],
+            narrative: false,
+        };
+        assert!(inline(&marker, &resolved).is_none());
     }
 
     #[test]
-    fn ignores_text_without_citekeys() {
-        assert!(!has_citekeys(""));
-        assert!(!has_citekeys("no citations here at all"));
-        assert!(!has_citekeys("a bare @ sign, and @1234 digits"));
+    fn references_are_appended_to_the_frontmatter() {
+        let src = "+++\ntitle = \"T\"\n\n[extra]\ntoc = true\n+++\n\nbody\n";
+        let out = set_references(src, &[reference("Smith2020", "Smith", "2020")]).unwrap();
+
+        assert!(out.contains("toc = true"));
+        assert!(out.contains("[[extra.references]]"));
+        assert!(out.contains(r#"key = "Smith2020""#));
+        assert!(out.ends_with("+++\n\nbody\n"));
+
+        let (toml_str, body) = crate::frontmatter::split(&out).unwrap();
+        toml_str
+            .parse::<toml::Table>()
+            .expect("frontmatter stays valid TOML");
+        assert_eq!(body.trim(), "body");
     }
 
-    /// A trailing `@` must not index past the end of the buffer.
+    /// A second run replaces the block rather than stacking another copy on it.
     #[test]
-    fn trailing_at_sign_does_not_panic() {
-        assert!(!has_citekeys("ends with @"));
+    fn rewriting_replaces_the_previous_block() {
+        let src = "+++\ntitle = \"T\"\n+++\n\nbody\n";
+        let once = set_references(src, &[reference("Smith2020", "Smith", "2020")]).unwrap();
+        let twice = set_references(&once, &[reference("Smith2020", "Smith", "2020")]).unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches("[[extra.references]]").count(), 1);
     }
 
-    /// The filter runs on raw bytes; multi-byte characters must not shift the result.
+    /// A post that cites nothing comes back untouched, trailing blank line and all.
+    /// Rewriting it would show up as a modified file on every build.
     #[test]
-    fn handles_non_ascii_content() {
-        assert!(has_citekeys("på norsk, se @Hansen2019"));
-        assert!(!has_citekeys("på norsk, ingen kilder"));
+    fn writing_no_references_leaves_the_frontmatter_alone() {
+        for src in [
+            "+++\ntitle = \"T\"\ndate = 2026-01-01\n+++\n\nbody\n",
+            "+++\ntitle = \"T\"\n\n[extra]\ntoc = true\n\n+++\n\nbody\n",
+            "+++\r\ntitle = \"T\"\r\n+++\r\n\r\nbody\r\n",
+        ] {
+            assert_eq!(set_references(src, &[]).unwrap(), src, "changed: {src:?}");
+        }
+    }
+
+    /// A CRLF post stays CRLF. Git normalises on commit, so the only visible effect of
+    /// getting this wrong is every touched post reading as modified.
+    #[test]
+    fn crlf_posts_keep_their_line_endings() {
+        let src = "+++\r\ntitle = \"T\"\r\n+++\r\n\r\nbody\r\n";
+        let out = set_references(src, &[reference("Smith2020", "Smith", "2020")]).unwrap();
+        assert!(!out.replace("\r\n", "").contains('\n'), "mixed endings: {out:?}");
+        assert!(out.contains("[[extra.references]]"));
+
+        let (toml_str, _) = crate::frontmatter::split(&out).unwrap();
+        toml_str
+            .parse::<toml::Table>()
+            .expect("frontmatter stays valid TOML");
+    }
+
+    /// The body is not the tool's to touch, `+++` in it included.
+    #[test]
+    fn the_body_comes_back_byte_for_byte() {
+        let src = "+++\ntitle = \"T\"\n+++\n\na += b\n\n+++ not frontmatter\n";
+        let out = set_references(src, &[reference("k", "Smith", "2020")]).unwrap();
+        assert!(out.ends_with("+++\n\na += b\n\n+++ not frontmatter\n"));
     }
 }

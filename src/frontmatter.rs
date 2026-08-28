@@ -32,6 +32,52 @@ pub fn split(content: &str) -> Result<(&str, &str), String> {
     Ok((toml_str, body))
 }
 
+/// Byte range of the TOML between the `+++` delimiters.
+///
+/// `split` trims what it returns, which is right for parsing and wrong for editing: a
+/// caller that means to rewrite part of the frontmatter needs to know where it sits in
+/// the file so the rest comes back byte for byte.
+pub fn bounds(content: &str) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    let mut lines = content.split_inclusive('\n');
+
+    let first = lines.next()?;
+    if first.trim_end() != "+++" {
+        return None;
+    }
+    offset += first.len();
+    let start = offset;
+
+    for line in lines {
+        if line.trim_end() == "+++" {
+            return Some((start, offset));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// The `[extra.bib]` map of citation key to DOI.
+///
+/// This is the whole of what a post has to carry to cite something without a Zotero
+/// library: a name for each source and the DOI it stands for.
+pub fn bib_map(toml_str: &str) -> std::collections::BTreeMap<String, String> {
+    let Ok(table) = toml_str.parse::<toml::Table>() else {
+        return Default::default();
+    };
+    table
+        .get("extra")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("bib"))
+        .and_then(|v| v.as_table())
+        .map(|t| {
+            t.iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse Zola +++ TOML frontmatter from a markdown file.
 pub fn parse(content: &str) -> Result<Frontmatter, String> {
     let (toml_str, _) = split(content)?;
@@ -178,6 +224,39 @@ Body text here.
         let (_, body) = split(src).unwrap();
         assert!(body.contains("a += b"));
         assert!(body.contains("+++ not frontmatter"));
+    }
+
+    #[test]
+    fn bounds_cover_the_toml_and_nothing_else() {
+        let src = "+++\ntitle = \"T\"\n+++\nbody\n";
+        let (start, end) = bounds(src).expect("frontmatter is there");
+        assert_eq!(&src[start..end], "title = \"T\"\n");
+        assert_eq!(&src[end..], "+++\nbody\n");
+    }
+
+    /// A `+++` later in the body is not a delimiter, and a file without frontmatter
+    /// has no bounds at all.
+    #[test]
+    fn bounds_only_read_a_leading_block() {
+        assert_eq!(bounds("body\n+++\na = 1\n+++\n"), None);
+        assert_eq!(bounds("+++\nunterminated\n"), None);
+        assert_eq!(bounds(""), None);
+    }
+
+    #[test]
+    fn bib_map_reads_key_to_doi() {
+        let toml_str = "title = \"T\"\n\n[extra.bib]\nChristiansen2017 = \"10.1016/j.marpol.2016.10.020\"\n";
+        let map = bib_map(toml_str);
+        assert_eq!(
+            map.get("Christiansen2017").map(String::as_str),
+            Some("10.1016/j.marpol.2016.10.020")
+        );
+    }
+
+    #[test]
+    fn bib_map_is_empty_when_absent_or_broken() {
+        assert!(bib_map("title = \"T\"").is_empty());
+        assert!(bib_map("not = = toml").is_empty());
     }
 
     #[test]

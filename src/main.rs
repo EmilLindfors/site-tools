@@ -1,12 +1,17 @@
 mod audio;
+mod bib;
 mod cite;
+mod codemask;
 mod cv;
 mod frontmatter;
 mod markdown;
+mod markers;
 mod newsletter;
 mod pdf;
+mod sources;
 mod speech;
 mod util;
+mod zotero;
 
 use std::{env, process};
 
@@ -41,7 +46,7 @@ fn main() {
 
 fn run_newsletter(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
-        eprintln!("Usage: site-tools newsletter <gen|send> ...");
+        eprintln!("Usage: site-tools newsletter <gen|send|check-sendlog> ...");
         process::exit(1);
     }
 
@@ -59,6 +64,11 @@ fn run_newsletter(args: &[String]) -> Result<(), String> {
             let slug = &args[1];
             let subject = parse_flag(&args[2..], "--subject");
             newsletter::send(slug, subject.as_deref())
+        }
+        "check-sendlog" => {
+            // Verifies the idempotency guard against the live server without sending
+            // anything. Reads SEND_LOG_URL / JMAP_LIST_USER / JMAP_LIST_PASSWORD.
+            newsletter::check_sendlog()
         }
         "-h" | "--help" | "help" => {
             print_newsletter_usage();

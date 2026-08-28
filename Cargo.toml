@@ -5,4 +5,18 @@ edition = "2021"
 
 [dependencies]
 toml = "0.8"
-zotero-cite = { git = "https://github.com/EmilLindfors/zotero-cite" }
+
+# Two citation sources, neither required. A `@key` that is a DOI, or that the post's
+# `[extra.bib]` maps to one, is resolved against crossref; anything left over falls back
+# to a local Zotero library. A site that only ever writes DOIs never opens Zotero, and a
+# post whose citations are already resolved touches neither.
+#
+# The Zotero side reads `zotero.sqlite` directly (see src/zotero.rs). Zotero 8 added a
+# native `citationKey` field and Better BibTeX migrated into it, so there is no longer a
+# separate Better BibTeX database to read and no reason for a crate in between.
+crossref-client = "0.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+# crossref-client is async and this is a CLI. One current-thread runtime, built where
+# the fetching happens, is the whole of the async surface here.
+tokio = { version = "1", features = ["rt", "time", "macros"] }

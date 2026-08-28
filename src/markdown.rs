@@ -118,7 +118,11 @@ fn clean_body(body: &str, post_base: &str) -> String {
             continue;
         }
 
-        out.push_str(&rewrite_links(line, post_base));
+        // A plain-markdown copy has no reference anchors to jump to -- its reference
+        // list is a bullet list -- so an inline citation keeps its year and loses its
+        // link.
+        let line = crate::bib::strip_citation_anchors(line);
+        out.push_str(&rewrite_links(&line, post_base));
         out.push('\n');
     }
 
@@ -131,7 +135,16 @@ fn yaml_quote(s: &str) -> String {
 }
 
 /// Render the full markdown document for one post.
-fn render(fm: &frontmatter::Frontmatter, body: &str, slug: &str) -> String {
+///
+/// `references` is the post's `[[extra.references]]` rendered as markdown. The web page
+/// gets its reference list from a template reading the frontmatter, so a plain-markdown
+/// copy of the post has to grow one here or it ships with citations pointing at nothing.
+fn render(
+    fm: &frontmatter::Frontmatter,
+    body: &str,
+    slug: &str,
+    references: Option<&str>,
+) -> String {
     let post_url = format!("{SITE_URL}/blog/{slug}/");
     let mut out = String::new();
 
@@ -157,6 +170,11 @@ fn render(fm: &frontmatter::Frontmatter, body: &str, slug: &str) -> String {
 
     out.push_str(clean_body(body, &post_url).trim());
     out.push('\n');
+
+    if let Some(references) = references {
+        out.push('\n');
+        out.push_str(references);
+    }
 
     out
 }
@@ -192,8 +210,9 @@ fn gen_inner(post_path: &str) -> Result<Option<PostRef>, String> {
         return Ok(None);
     }
 
-    let (_, body) = frontmatter::split(&content)?;
-    let document = render(&fm, body, &slug);
+    let (toml_str, body) = frontmatter::split(&content)?;
+    let references = crate::bib::references_markdown(toml_str);
+    let document = render(&fm, body, &slug, references.as_deref());
 
     let root = crate::util::find_project_root(path)?;
     let out_dir = root.join("static/blog");
@@ -244,7 +263,73 @@ pub fn gen_all() -> Result<(), String> {
 
     prune(&root, &posts)?;
     write_llms_txt(&root, &published)?;
+    write_recent_json(&root, &published)?;
     Ok(())
+}
+
+/// How many posts the welcome email lists.
+const RECENT_COUNT: usize = 5;
+
+/// Write `static/newsletter/recent.json` — the post list the welcome email renders.
+///
+/// A dedicated file rather than having the Worker parse `atom.xml` or `llms.txt`: those
+/// are formats with their own audiences, and an email quietly breaking because one of
+/// them was reformatted is a bad trade for the twenty lines this costs. The Worker fetches
+/// it at confirmation time, so the list is whatever the last deploy published, and a
+/// failure to fetch it just means a welcome mail without a list.
+fn write_recent_json(root: &Path, posts: &[PostRef]) -> Result<(), String> {
+    let mut out = String::from("[\n");
+    for (i, post) in posts.iter().take(RECENT_COUNT).enumerate() {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&format!(
+            "  {{\"title\": {}, \"url\": {}, \"date\": {}, \"description\": {}}}",
+            json_string(&post.title),
+            json_string(&format!("{SITE_URL}/blog/{}/", post.slug)),
+            json_string(&post.date),
+            json_string(&post.description),
+        ));
+    }
+    out.push_str("\n]\n");
+
+    let out_dir = root.join("static/newsletter");
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", out_dir.display()))?;
+    let out_path = out_dir.join("recent.json");
+    fs::write(&out_path, &out)
+        .map_err(|e| format!("Failed to write {}: {e}", out_path.display()))?;
+
+    println!(
+        "Recent: {} ({} of {} posts)",
+        out_path.display(),
+        posts.len().min(RECENT_COUNT),
+        posts.len()
+    );
+    Ok(())
+}
+
+/// A JSON string literal, escaped.
+///
+/// A post title is authored text and can hold a quote or a backslash. `serde_json`
+/// would do this, but site-tools does not otherwise depend on it and one escape
+/// function is cheaper than a dependency.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Write `static/llms.txt` — the index described at https://llmstxt.org/.
@@ -437,7 +522,7 @@ mod tests {
             draft: false,
             tags: vec!["rust".into(), "zola".into()],
         };
-        let doc = render(&fm, "\n## Section\n\nBody.\n", "a-post");
+        let doc = render(&fm, "\n## Section\n\nBody.\n", "a-post", None);
 
         assert!(doc.starts_with("---\ntitle: \"A post\"\n"));
         assert!(doc.contains("tags: [\"rust\", \"zola\"]"));

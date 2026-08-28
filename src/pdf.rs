@@ -15,7 +15,8 @@ pub fn gen(post_path: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to read {post_path}: {e}"))?;
 
     let fm = frontmatter::parse(&content)?;
-    let (_, body) = frontmatter::split(&content)?;
+    let (toml_str, body) = frontmatter::split(&content)?;
+    let references = crate::bib::references_markdown(toml_str);
     let slug = frontmatter::slug_from_path(path);
 
     // Drafts are unpublished, but static/pdf/<slug>.pdf is served at a guessable URL,
@@ -38,8 +39,9 @@ pub fn gen(post_path: &str) -> Result<(), String> {
     // Copy images. Typst reads WebP natively, so nothing is converted.
     copy_images(post_dir, &temp_dir)?;
 
-    // Preprocess markdown body
-    let processed = preprocess_body(body);
+    // Preprocess markdown body. References live in the frontmatter, where Typst cannot
+    // see them, so the section the web page renders from a template is appended here.
+    let processed = preprocess_body(body, references.as_deref());
     let content_path = temp_dir.join("content.md");
     fs::write(&content_path, &processed)
         .map_err(|e| format!("Failed to write content.md: {e}"))?;
@@ -80,6 +82,22 @@ pub fn gen(post_path: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to create {}: {e}", output_dir.display()))?;
 
     let output_path = output_dir.join(format!("{slug}.pdf"));
+
+    // Remove the previous PDF before writing the new one.
+    //
+    // On Windows a process that has the file memory-mapped -- the search indexer or a
+    // virus scanner, seconds after the last build wrote it -- makes typst fail with
+    // "cannot be performed on a file with a user-mapped section open" (os error 1224).
+    // Creating the file fresh is allowed where overwriting it in place is not.
+    //
+    // This matters more than a retry would: `build.sh` downgrades a PDF failure to a
+    // warning, so the visible result was a build that said "Done!" while shipping the
+    // previous PDF for a post that had changed. An unlinked file that then fails to
+    // regenerate is at least an obviously missing one.
+    if output_path.exists() {
+        fs::remove_file(&output_path)
+            .map_err(|e| format!("Failed to replace {}: {e}", output_path.display()))?;
+    }
 
     // One recursive path covers inter, literata, jetbrains-mono and libertinus.
     // Listing subdirectories individually is how JetBrains Mono and Libertinus Serif
@@ -221,7 +239,7 @@ fn date_to_epoch(date: &str) -> Option<i64> {
 }
 
 /// Preprocess markdown body for Typst compatibility.
-fn preprocess_body(body: &str) -> String {
+fn preprocess_body(body: &str, references: Option<&str>) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     for line in body.lines() {
@@ -232,7 +250,8 @@ fn preprocess_body(body: &str) -> String {
 
         let mut line = line.to_string();
 
-        // Convert citation links [N](#ref-...) to plain text
+        // Citation links, in both the HTML and the older markdown form, to plain text
+        line = crate::bib::strip_citation_anchors(&line);
         line = replace_citation_links(&line);
 
         // Convert HTML reference paragraphs to markdown
@@ -241,10 +260,18 @@ fn preprocess_body(body: &str) -> String {
         lines.push(line);
     }
 
-    lines.join("\n")
+    let mut out = lines.join("\n");
+    if let Some(references) = references {
+        out.push_str("\n\n");
+        out.push_str(references);
+    }
+    out
 }
 
 /// Replace `[text](#ref-...)` links with just the text.
+///
+/// The markdown form is what `cite` used to write. Kept so a post resolved before the
+/// switch to HTML anchors still renders a clean PDF.
 fn replace_citation_links(line: &str) -> String {
     let mut result = String::with_capacity(line.len());
     let mut rest = line;
@@ -411,7 +438,7 @@ mod tests {
 
     #[test]
     fn strips_the_more_separator() {
-        let out = preprocess_body("intro\n<!-- more -->\nrest\n");
+        let out = preprocess_body("intro\n<!-- more -->\nrest\n", None);
         assert!(!out.contains("<!-- more -->"));
         assert!(out.contains("intro") && out.contains("rest"));
     }
@@ -420,7 +447,7 @@ mod tests {
     /// pointed at files that no longer get created.
     #[test]
     fn leaves_webp_references_alone() {
-        let out = preprocess_body("![hero](hero.webp)\n");
+        let out = preprocess_body("![hero](hero.webp)\n", None);
         assert!(out.contains("hero.webp"), "got: {out}");
         assert!(!out.contains(".png"));
     }

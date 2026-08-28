@@ -182,6 +182,9 @@ fn flatten_images(line: &str) -> String {
 }
 
 /// Replace every `[text](target)` with just the text.
+///
+/// An inline citation is an `<a href="#ref-...">` rather than a markdown link, so it is
+/// stripped separately, by `bib::strip_citation_anchors`.
 fn flatten_links(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
@@ -351,6 +354,7 @@ fn spoken_line(line: &str) -> Option<String> {
     text = strip_list_marker(&text).to_string();
     text = flatten_math(&text);
     text = flatten_images(&text);
+    text = crate::bib::strip_citation_anchors(&text);
     text = flatten_links(&text);
     text = strip_inline_markup(&text);
 
@@ -897,6 +901,15 @@ mod tests {
     #[test]
     fn inline_citation_keeps_the_year_and_drops_the_anchor() {
         let out = script_of("Research by Christiansen ([2017](#ref-Christiansen2017)) found it.\n");
+        assert_eq!(out, "Research by Christiansen (2017) found it.");
+    }
+
+    /// `cite` writes the anchor as raw HTML, which no listener wants read out.
+    #[test]
+    fn an_html_citation_anchor_is_read_as_the_year_alone() {
+        let out = script_of(
+            "Research by Christiansen (<a href=\"#ref-Christiansen2017\">2017</a>) found it.\n",
+        );
         assert_eq!(out, "Research by Christiansen (2017) found it.");
     }
 
