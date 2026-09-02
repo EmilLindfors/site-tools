@@ -4,9 +4,11 @@ mod cite;
 mod codemask;
 mod cv;
 mod frontmatter;
+mod hero;
 mod markdown;
 mod markers;
 mod newsletter;
+mod og;
 mod pdf;
 mod sources;
 mod speech;
@@ -27,8 +29,10 @@ fn main() {
         "audio" => run_audio(&args[2..]),
         "cite" => cite::run(&args[2..]),
         "cv" => run_cv(&args[2..]),
+        "hero" => run_hero(&args[2..]),
         "markdown" => run_markdown(&args[2..]),
         "newsletter" => run_newsletter(&args[2..]),
+        "og" => run_og(&args[2..]),
         "pdf" => run_pdf(&args[2..]),
         "speech" => run_speech(&args[2..]),
         "-h" | "--help" | "help" => {
@@ -144,6 +148,55 @@ fn run_speech(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!("Unknown speech subcommand: {other}")),
+    }
+}
+
+fn run_hero(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        print_hero_usage();
+        process::exit(1);
+    }
+
+    let force = args.iter().any(|a| a == "--force");
+    let target = args.get(1).filter(|a| !a.starts_with("--"));
+
+    match args[0].as_str() {
+        "gen" => {
+            let target = target.ok_or("Usage: site-tools hero gen <slug|post-path> [--force]")?;
+            hero::gen(target, force)
+        }
+        "card" => {
+            let target = target.ok_or("Usage: site-tools hero card <slug|post-path> [--force]")?;
+            hero::card(target, force)
+        }
+        "all" => hero::gen_all(force),
+        "-h" | "--help" | "help" => {
+            print_hero_usage();
+            Ok(())
+        }
+        other => Err(format!("Unknown hero subcommand: {other}")),
+    }
+}
+
+fn run_og(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        print_og_usage();
+        process::exit(1);
+    }
+
+    match args[0].as_str() {
+        "gen" => {
+            if args.len() < 2 {
+                return Err("Usage: site-tools og gen <post-path>".to_string());
+            }
+            og::gen(&args[1])
+        }
+        "all" => og::gen_all(),
+        "-h" | "--help" | "help" => {
+            print_og_usage();
+            Ok(())
+        }
+        other => Err(format!("Unknown og subcommand: {other}")),
     }
 }
 
@@ -274,6 +327,34 @@ fn print_speech_usage() {
     eprintln!("overrides go in speech-lexicon.toml at the project root.");
     eprintln!();
     eprintln!("Drafts are skipped. Set INCLUDE_DRAFTS=1 to generate one anyway.");
+}
+
+fn print_hero_usage() {
+    eprintln!("site-tools hero — Generate a post's hero image and social card through OpenRouter");
+    eprintln!();
+    eprintln!("Subcommands:");
+    eprintln!("  gen <slug|post-path>   Text-free hero -> hero.webp + hero-thumb.webp (via img-optim)");
+    eprintln!("  card <slug|post-path>  Card with the title drawn in -> card.webp next to the post");
+    eprintln!("  all                    Both, for every post with a hero.prompt.txt and no output yet");
+    eprintln!();
+    eprintln!("Flags:");
+    eprintln!("  --force  Regenerate even when the file exists");
+    eprintln!();
+    eprintln!("The subject comes from hero.prompt.txt in the post directory, the style from");
+    eprintln!("hero-style.txt at the project root. Reads OPENROUTER_API_KEY and, optionally,");
+    eprintln!("OPENROUTER_IMAGE_MODEL from the environment or .env. Costs money; never run by");
+    eprintln!("build.sh.");
+}
+
+fn print_og_usage() {
+    eprintln!("site-tools og — Render the 1200x630 share image for each post");
+    eprintln!();
+    eprintln!("Subcommands:");
+    eprintln!("  gen <post-path>  Write static/og/<slug>.png for one post");
+    eprintln!("  all              Same, for every published post, and prune stale files");
+    eprintln!();
+    eprintln!("Uses card.webp next to the post when there is one, otherwise composes the title");
+    eprintln!("over the featured image or the palette with Typst. Needs typst and fonts/.");
 }
 
 fn print_cv_usage() {

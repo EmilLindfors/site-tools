@@ -20,3 +20,8 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # crossref-client is async and this is a CLI. One current-thread runtime, built where
 # the fetching happens, is the whole of the async surface here.
 tokio = { version = "1", features = ["rt", "time", "macros"] }
+
+# `hero`: the OpenRouter reply is JSON with the image inline as a base64 data URL. Both
+# crates were already in the tree as dependencies of crossref-client.
+serde_json = "1"
+base64 = "0.22"
