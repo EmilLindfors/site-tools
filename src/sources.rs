@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crossref_client::{Contributor, Crossref, Work};
+use crossref_client::{CnFormat, Contributor, Crossref, Work};
 
 use crate::bib::Reference;
 
@@ -129,6 +129,18 @@ impl Resolver {
 /// burst with a `429`; naming an address moves the caller into the polite pool. The
 /// address is read from `CROSSREF_POLITE` rather than assumed from the site config,
 /// because handing an email to a third party is the author's decision to make.
+/// A reference rendered by crossref in a named CSL style (`apa`, `ieee`,
+/// `vancouver`, ...). Crossref formats it server-side from the deposited
+/// metadata, so this needs a DOI and the network, and answers an unknown style
+/// with a 406. Content negotiation cannot cover a Zotero-only reference.
+pub fn format_bibliography(doi: &str, style: &str) -> Result<String, String> {
+    let client = build_client()?;
+    let rendered = runtime()?
+        .block_on(client.transform(doi, &CnFormat::bibliography(style)))
+        .map_err(|e| format!("crossref could not render {doi} as {style}: {e}"))?;
+    Ok(rendered.trim().to_string())
+}
+
 fn build_client() -> Result<Crossref, String> {
     let polite = std::env::var("CROSSREF_POLITE").ok();
     let mut builder = Crossref::builder().user_agent("site-tools (+https://lindfors.no)");

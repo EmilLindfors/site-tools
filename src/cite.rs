@@ -88,6 +88,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
             println!("\nFrontmatter:\n{}", reference.to_toml_block());
             Ok(())
         }
+        "format" => {
+            if args.len() < 2 {
+                return Err("Usage: site-tools cite format <citekey|doi> [--style apa] [--source auto|crossref|zotero]".to_string());
+            }
+            let key = args[1].trim_start_matches('@');
+            let style = super::parse_flag(&args[2..], "--style").unwrap_or_else(|| "apa".to_string());
+            let mut resolver = Resolver::new(parse_source(&args[2..])?);
+            let reference = resolver.resolve(key, None)?;
+            let doi = reference.doi.as_deref().ok_or_else(|| {
+                format!("@{key} has no DOI, and crossref can only format a work it registered")
+            })?;
+            println!("{}", crate::sources::format_bibliography(doi, &style)?);
+            Ok(())
+        }
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -333,9 +347,13 @@ fn print_usage() {
     eprintln!("  all [--source ...]          Same, in place, for every post under content/blog/");
     eprintln!("  list                        List all available citekeys from Zotero");
     eprintln!("  lookup <citekey|doi>        Show what a marker resolves to");
+    eprintln!("  format <citekey|doi> [--style apa]");
+    eprintln!("                              The reference as crossref renders it in a CSL");
+    eprintln!("                              style (apa, ieee, vancouver, ...); needs a DOI");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --source auto|crossref|zotero   auto routes on the marker's shape (default)");
+    eprintln!("  --style <csl-style>             for `format`; https://api.crossref.org/styles lists them");
     eprintln!();
     eprintln!("Environment:");
     eprintln!("  CROSSREF_POLITE  an email address, which moves crossref requests into its");
