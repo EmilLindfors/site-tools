@@ -61,7 +61,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let week = crate::parse_flag(&args[1..], "--week");
             let subject = crate::parse_flag(&args[1..], "--subject");
             let send = !args[1..].iter().any(|a| a == "--no-send");
-            add(&root, &remote, slug, week.as_deref(), subject.as_deref(), send)
+            let twir = args[1..].iter().any(|a| a == "--twir");
+            add(&root, &remote, slug, week.as_deref(), subject.as_deref(), send, twir)
         }
     }
 }
@@ -70,8 +71,9 @@ fn print_usage() {
     eprintln!("site-tools schedule — Queue a post for publishing on the box");
     eprintln!();
     eprintln!("Subcommands:");
-    eprintln!("  <slug> [--week YYYY-Www] [--no-send] [--subject ...]");
+    eprintln!("  <slug> [--week YYYY-Www] [--no-send] [--subject ...] [--twir]");
     eprintln!("                    Copy content/blog/<slug>/ and its audio to the queue");
+    eprintln!("                    --twir: submit it to This Week in Rust when it goes out");
     eprintln!("  list              What is queued, and what the next run would do");
     eprintln!("  remove <slug>     Take a post back out of the queue");
     eprintln!();
@@ -94,7 +96,13 @@ fn check_slug(slug: &str) -> Result<(), String> {
 }
 
 /// The sidecar that rides with the bundle. `publish` reads it and strips it.
-pub fn sidecar(slug: &str, title: &str, queued_at: &str, week: Option<&str>, subject: Option<&str>, send: bool) -> String {
+///
+/// `twir` is the one promotion decision made here: the publisher turns it into a
+/// `Syndicate: this-week-in-rust` trailer on the publish commit, and the `twir`
+/// workflow in `.github/workflows/` opens the pull request on that push. A `rust` tag
+/// does not make a post Rust content (the analytics post has one and is a JavaScript
+/// loader), so this is a flag per post, not a rule.
+pub fn sidecar(slug: &str, title: &str, queued_at: &str, week: Option<&str>, subject: Option<&str>, send: bool, twir: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!("slug = {}\n", toml_string(slug)));
     out.push_str(&format!("title = {}\n", toml_string(title)));
@@ -106,6 +114,9 @@ pub fn sidecar(slug: &str, title: &str, queued_at: &str, week: Option<&str>, sub
     if let Some(subject) = subject {
         out.push_str(&format!("subject = {}\n", toml_string(subject)));
     }
+    if twir {
+        out.push_str("twir = true\n");
+    }
     out
 }
 
@@ -113,7 +124,7 @@ fn toml_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn add(root: &Path, remote: &Remote, slug: &str, week: Option<&str>, subject: Option<&str>, send: bool) -> Result<(), String> {
+fn add(root: &Path, remote: &Remote, slug: &str, week: Option<&str>, subject: Option<&str>, send: bool, twir: bool) -> Result<(), String> {
     check_slug(slug)?;
     if let Some(week) = week {
         crate::publish::parse_week(week)?;
@@ -157,7 +168,7 @@ fn add(root: &Path, remote: &Remote, slug: &str, week: Option<&str>, subject: Op
     }
 
     let queued_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let sidecar = sidecar(slug, &fm.title, &queued_at, week, subject, send);
+    let sidecar = sidecar(slug, &fm.title, &queued_at, week, subject, send, twir);
 
     // Stage the entry as the queue will hold it: post/, static/, schedule.toml.
     let staging = std::env::temp_dir().join(format!("site-tools-schedule-{slug}"));
@@ -188,6 +199,7 @@ fn add(root: &Path, remote: &Remote, slug: &str, week: Option<&str>, subject: Op
         None => println!("  week: next free slot"),
     }
     println!("  newsletter: {}", if send { "yes" } else { "no" });
+    println!("  this week in rust: {}", if twir { "yes" } else { "no" });
     for rel in &extras {
         println!("  with {rel}");
     }
@@ -299,22 +311,24 @@ mod tests {
 
     #[test]
     fn sidecar_carries_the_slot_and_the_send_flag() {
-        let s = sidecar("a-post", "A \"quoted\" title", "2026-09-03T20:00:00Z", Some("2026-W41"), None, true);
+        let s = sidecar("a-post", "A \"quoted\" title", "2026-09-03T20:00:00Z", Some("2026-W41"), None, true, false);
         let table: toml::Table = s.parse().unwrap();
         assert_eq!(table["slug"].as_str(), Some("a-post"));
         assert_eq!(table["title"].as_str(), Some("A \"quoted\" title"));
         assert_eq!(table["week"].as_str(), Some("2026-W41"));
         assert_eq!(table["send"].as_bool(), Some(true));
         assert!(table.get("subject").is_none());
+        assert!(table.get("twir").is_none());
     }
 
     #[test]
     fn sidecar_without_a_week_means_next_free_slot() {
-        let s = sidecar("a-post", "T", "2026-09-03T20:00:00Z", None, Some("From the archive"), false);
+        let s = sidecar("a-post", "T", "2026-09-03T20:00:00Z", None, Some("From the archive"), false, true);
         let table: toml::Table = s.parse().unwrap();
         assert!(table.get("week").is_none());
         assert_eq!(table["send"].as_bool(), Some(false));
         assert_eq!(table["subject"].as_str(), Some("From the archive"));
+        assert_eq!(table["twir"].as_bool(), Some(true));
     }
 
     #[test]

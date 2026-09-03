@@ -112,9 +112,14 @@ change: `./newsletter/build.sh`, copy, `rc-service lindfors-newsletter restart`.
 ```sh
 site-tools schedule <slug>                    # next free week; --week 2026-W41 pins one
 site-tools schedule <slug> --no-send          # publish without an issue
+site-tools schedule <slug> --twir             # and submit it to This Week in Rust
 site-tools schedule list                      # the queue, and what the next run picks
 site-tools schedule remove <slug>
 ```
+
+`--twir` costs the box nothing: the publish commit gets a `Syndicate: this-week-in-rust`
+trailer and the repo's `twir` workflow opens the pull request on the push, with the
+`TWIR_TOKEN` secret on GitHub. Nothing here holds a GitHub API token.
 
 On the box, the same binary answers `publish next` (a dry run), `publish run --now`
 (ignore the hour), `publish run --force` (ignore the one-per-week rule), and

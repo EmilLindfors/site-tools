@@ -122,8 +122,14 @@ pub struct Entry {
     pub week: Option<(i32, u32)>,
     pub send: bool,
     pub subject: Option<String>,
+    /// Submit to This Week in Rust: a trailer on the publish commit, acted on by the
+    /// `twir` workflow in the repo, not by anything on this box.
+    pub twir: bool,
     pub dir: PathBuf,
 }
+
+/// The commit trailer the `twir` workflow greps for; the two must agree.
+pub const TWIR_TRAILER: &str = "Syndicate: this-week-in-rust";
 
 impl Entry {
     fn parse(dir: &Path, sidecar: &str) -> Result<Entry, String> {
@@ -141,6 +147,7 @@ impl Entry {
             week,
             send: table.get("send").and_then(|v| v.as_bool()).unwrap_or(true),
             subject: get("subject"),
+            twir: table.get("twir").and_then(|v| v.as_bool()).unwrap_or(false),
             dir: dir.to_path_buf(),
         })
     }
@@ -391,10 +398,11 @@ fn list(config: &Config) -> Result<(), String> {
         println!("Queue ({}):", config.queue.display());
         for e in &entries {
             println!(
-                "  {:<40} {:<16} {}  queued {}{}",
+                "  {:<40} {:<16} {}  {}  queued {}{}",
                 e.slug,
                 e.slot_text(),
                 if e.send { "newsletter" } else { "no mail   " },
+                if e.twir { "twir" } else { "    " },
                 e.queued_at,
                 e.subject.as_ref().map(|s| format!("  subject: {s}")).unwrap_or_default()
             );
@@ -444,9 +452,10 @@ fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<()
     };
 
     println!(
-        "{week_text}: {} would go out{}{}",
+        "{week_text}: {} would go out{}{}{}",
         entry.slug,
         if entry.send { " with a newsletter" } else { ", no newsletter" },
+        if entry.twir { ", submitted to This Week in Rust" } else { "" },
         if dry { " (dry run)" } else { "" }
     );
     if dry {
@@ -494,7 +503,7 @@ fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<()
 
     // --- Commit and push ------------------------------------------------------------
     git(&config.repo, &["add", "-A"])?;
-    let message = format!("Publish: {}", if entry.title.is_empty() { &entry.slug } else { &entry.title });
+    let message = commit_message(entry);
     git(&config.repo, &["commit", "--quiet", "-m", &message])?;
     let hash = git(&config.repo, &["rev-parse", "--short", "HEAD"])?;
     git(&config.repo, &["push", "--quiet", &config.remote, &format!("HEAD:{}", config.branch)])?;
@@ -538,6 +547,18 @@ fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<()
     }
     println!("published {} {} commit={} newsletter=sent", entry.slug, date, hash.trim());
     Ok(())
+}
+
+/// `Publish: <title>`, plus the syndication trailer when the sidecar asked for it.
+/// The trailer is what the `twir` workflow reads off the push; nothing here talks to
+/// GitHub's API, so the box needs no token beyond its deploy key.
+fn commit_message(entry: &Entry) -> String {
+    let title = if entry.title.is_empty() { &entry.slug } else { &entry.title };
+    if entry.twir {
+        format!("Publish: {title}\n\n{TWIR_TRAILER}\n")
+    } else {
+        format!("Publish: {title}")
+    }
 }
 
 /// Poll until every URL answers 200, or give up after `minutes`.
@@ -602,8 +623,18 @@ mod tests {
             week,
             send: true,
             subject: None,
+            twir: false,
             dir: PathBuf::from(slug),
         }
+    }
+
+    #[test]
+    fn commit_message_carries_the_trailer_only_when_asked() {
+        let mut e = entry("a-post", "2026-09-01T00:00:00Z", None);
+        e.title = "A title".into();
+        assert_eq!(commit_message(&e), "Publish: A title");
+        e.twir = true;
+        assert_eq!(commit_message(&e), "Publish: A title\n\nSyndicate: this-week-in-rust\n");
     }
 
     #[test]
@@ -711,12 +742,16 @@ mod tests {
 
     #[test]
     fn sidecar_round_trips_through_entry() {
-        let text = crate::schedule::sidecar("a-post", "A", "2026-09-03T20:00:00Z", Some("2026-W41"), Some("Subj"), false);
+        let text = crate::schedule::sidecar("a-post", "A", "2026-09-03T20:00:00Z", Some("2026-W41"), Some("Subj"), false, true);
         let e = Entry::parse(Path::new("/q/a-post"), &text).unwrap();
         assert_eq!(e.slug, "a-post");
         assert_eq!(e.week, Some((2026, 41)));
         assert!(!e.send);
+        assert!(e.twir);
         assert_eq!(e.subject.as_deref(), Some("Subj"));
         assert_eq!(e.slot_text(), "2026-W41");
+        // A sidecar from before the key existed is not a submission.
+        let old = crate::schedule::sidecar("b", "B", "2026-09-03T20:00:00Z", None, None, true, false);
+        assert!(!Entry::parse(Path::new("/q/b"), &old).unwrap().twir);
     }
 }
