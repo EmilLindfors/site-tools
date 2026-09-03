@@ -1,0 +1,37 @@
+# The publisher's configuration, at /etc/lindfors-publisher.toml on mail.lindfors.no.
+# Read by `site-tools publish` on every run. Every key has the default shown here.
+#
+# The cadence is here and nowhere else: change the weekday or the hour and every
+# queued post moves with it. A post pins itself to a week with `--week` when it is
+# queued; nothing in a post names a day or an hour.
+
+# A clone of the site repo the publisher account can push to, with its own deploy
+# key. The run resets it to the remote branch before doing anything, so nothing kept
+# in it survives except what is ignored (fonts/).
+repo = "/srv/lindfors-publisher/site"
+
+# Where `site-tools schedule` puts a post, and where a published one is moved to.
+queue = "/srv/lindfors-publisher/queue"
+archive = "/srv/lindfors-publisher/published"
+
+# The weekly slot. The run every hour does nothing before it, and after it publishes
+# the next queued post unless the week already has one. Weekends are simply not the
+# weekday named here.
+weekday = "tuesday"
+hour = 8
+minute = 0
+timezone = "Europe/Oslo"
+
+# Posts allowed to carry a date in one ISO week, counting the ones published by hand.
+max_per_week = 1
+
+# Polled after the push until the page and the issue answer 200; the send waits on it.
+site_url = "https://lindfors.no"
+wait_minutes = 20
+
+# The send, with the slug appended. sudo is what lets it read the newsletter's
+# environment file; /etc/sudoers.d/lindfors-publisher allows exactly this command.
+send_command = ["sudo", "/opt/lindfors-newsletter/send-issue"]
+
+remote = "origin"
+branch = "main"

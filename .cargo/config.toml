@@ -1,0 +1,10 @@
+# Cross-compiling to the host (Alpine, aarch64, musl) with nothing installed but a
+# rustup target. Same arrangement as newsletter/.cargo/config.toml: the target is
+# statically linked against the musl that rustup's rust-std ships, and rust-lld links
+# it, so no cross C toolchain is needed.
+#
+# That holds only for a build with `--no-default-features`, which leaves out `cite`
+# (crossref-client and bundled SQLite are C). Everything the publisher runs is pure
+# Rust; see tools/site-tools/build-host.sh.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

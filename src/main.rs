@@ -1,18 +1,30 @@
 mod audio;
+// Without `cite`, the halves of these that only the citation pipeline calls are dead
+// code in the publisher build; the modules are shared, so the warnings are not worth
+// a second copy.
+#[cfg_attr(not(feature = "cite"), allow(dead_code))]
 mod bib;
+#[cfg(feature = "cite")]
 mod cite;
+#[cfg_attr(not(feature = "cite"), allow(dead_code))]
 mod codemask;
 mod cv;
+#[cfg_attr(not(feature = "cite"), allow(dead_code))]
 mod frontmatter;
 mod hero;
 mod markdown;
+#[cfg_attr(not(feature = "cite"), allow(dead_code))]
 mod markers;
 mod newsletter;
 mod og;
 mod pdf;
+mod publish;
+mod schedule;
+#[cfg(feature = "cite")]
 mod sources;
 mod speech;
 mod util;
+#[cfg(feature = "cite")]
 mod zotero;
 
 use std::{env, process};
@@ -27,13 +39,18 @@ fn main() {
 
     let result = match args[1].as_str() {
         "audio" => run_audio(&args[2..]),
+        #[cfg(feature = "cite")]
         "cite" => cite::run(&args[2..]),
+        #[cfg(not(feature = "cite"))]
+        "cite" => Err("this build has no `cite` feature; resolve citations on the workstation before scheduling".to_string()),
         "cv" => run_cv(&args[2..]),
         "hero" => run_hero(&args[2..]),
         "markdown" => run_markdown(&args[2..]),
         "newsletter" => run_newsletter(&args[2..]),
         "og" => run_og(&args[2..]),
         "pdf" => run_pdf(&args[2..]),
+        "publish" => publish::run(&args[2..]),
+        "schedule" => schedule::run(&args[2..]),
         "speech" => run_speech(&args[2..]),
         "-h" | "--help" | "help" => {
             print_usage();
@@ -266,6 +283,9 @@ fn print_usage() {
     eprintln!("  newsletter gen <post-path>              Generate newsletter .md from blog post");
     eprintln!("  newsletter send <slug> [--subject ...]  Send newsletter to subscribers");
     eprintln!("  pdf gen <post-path>                     Generate PDF from blog post");
+    eprintln!("  publish run|next|list|unqueue           On the box: publish the next queued post (publish help)");
+    eprintln!("  schedule <slug> [--week YYYY-Www]       Queue a draft on the box for its week (schedule help)");
+    eprintln!("  schedule list | remove <slug>           See the queue, or take a post back out");
     eprintln!("  pdf all                                 Generate PDFs for all posts (skips drafts)");
     eprintln!("  speech gen <post-path>                  Write the spoken script for one post");
     eprintln!("  speech all                              Same, for every post (skips drafts)");
