@@ -63,11 +63,14 @@ fn run_newsletter(args: &[String]) -> Result<(), String> {
         }
         "send" => {
             if args.len() < 2 {
-                return Err("Usage: site-tools newsletter send <slug> [--subject <text>]".to_string());
+                return Err("Usage: site-tools newsletter send <slug> [--subject <text>] [--catch-up]".to_string());
             }
             let slug = &args[1];
             let subject = parse_flag(&args[2..], "--subject");
-            newsletter::send(slug, subject.as_deref())
+            // --catch-up: only to subscribers who have not received this issue, so an
+            // old post or a series can reach newcomers without going to everyone twice.
+            let catch_up = args[2..].iter().any(|a| a == "--catch-up");
+            newsletter::send(slug, subject.as_deref(), catch_up)
         }
         "-h" | "--help" | "help" => {
             print_newsletter_usage();

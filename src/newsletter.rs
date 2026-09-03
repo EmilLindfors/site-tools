@@ -138,7 +138,7 @@ pub fn gen(post_path: &str) -> Result<(), String> {
 }
 
 /// Send a newsletter via the API.
-pub fn send(slug: &str, subject: Option<&str>) -> Result<(), String> {
+pub fn send(slug: &str, subject: Option<&str>, catch_up: bool) -> Result<(), String> {
     let project_root = std::env::current_dir()
         .map_err(|e| format!("Failed to get cwd: {e}"))?;
     let env_path = find_env_file(&project_root)?;
@@ -146,17 +146,30 @@ pub fn send(slug: &str, subject: Option<&str>) -> Result<(), String> {
     let admin_key = read_env_var(&env_path, "ADMIN_KEY")?;
 
     // Build JSON body
-    let body = match subject {
-        Some(s) => format!(r#"{{"slug":"{slug}","subject":"{s}"}}"#),
-        None => format!(r#"{{"slug":"{slug}"}}"#),
-    };
+    // Serialised rather than formatted: a subject with a quote in it must not break
+    // the request.
+    let mut body = serde_json::json!({ "slug": slug });
+    if let Some(s) = subject {
+        body["subject"] = serde_json::Value::String(s.to_string());
+    }
+    if catch_up {
+        body["mode"] = serde_json::Value::String("catch-up".to_string());
+    }
+    let body = body.to_string();
 
     println!("Newsletter: {slug}");
     if let Some(s) = subject {
         println!("Subject override: {s}");
     }
+    if catch_up {
+        println!("Catch-up: only subscribers who have not received this issue.");
+    }
     println!();
-    eprint!("Send to all subscribers? [y/N] ");
+    if catch_up {
+        eprint!("Send to the subscribers who have not had it? [y/N] ");
+    } else {
+        eprint!("Send to all subscribers? [y/N] ");
+    }
 
     let stdin = io::stdin();
     let mut line = String::new();
