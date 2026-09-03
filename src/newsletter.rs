@@ -93,8 +93,9 @@ pub fn gen(post_path: &str) -> Result<(), String> {
     // is an `<a href="#ref-...">`, and an email has no reference list to jump to — so
     // without this the reader gets "Christiansen & Jakobsen (2017)" as a link to nowhere
     // and no way to find out what it refers to.
-    let cleaned = crate::bib::strip_citation_anchors(&clean_body(body));
+    let cleaned = tag_links(&crate::bib::strip_citation_anchors(&clean_body(body)), &slug);
     let references = crate::bib::references_markdown(toml_str);
+    let tagged_url = tag_url(&post_url, &slug);
 
     // Build output
     let mut output = String::new();
@@ -102,7 +103,7 @@ pub fn gen(post_path: &str) -> Result<(), String> {
     output.push_str(&format!("title: \"{}\"\n", fm.title));
     output.push_str(&format!("date: \"{}\"\n", fm.date));
     output.push_str(&format!("description: \"{}\"\n", fm.description));
-    output.push_str(&format!("url: \"{post_url}\"\n"));
+    output.push_str(&format!("url: \"{tagged_url}\"\n"));
     output.push_str("---\n");
     output.push_str(&cleaned);
 
@@ -114,7 +115,7 @@ pub fn gen(post_path: &str) -> Result<(), String> {
     // Append footer with link to full post
     output.push_str("\n---\n\n");
     output.push_str(&format!(
-        "*[Read the full post on the site]({post_url}) for math equations, citations, and interactive features.*\n"
+        "*[Read the full post on the site]({tagged_url}) for math equations, citations, and interactive features.*\n"
     ));
 
     // Write to static/newsletter/<slug>.md
@@ -135,6 +136,64 @@ pub fn gen(post_path: &str) -> Result<(), String> {
     println!("  2. site-tools newsletter send {slug}");
 
     Ok(())
+}
+
+/// The query parameter every link into the site carries in an issue: `?issue=<slug>`.
+///
+/// Feedback per issue, not per reader. A visit that starts from the mail shows up in
+/// the RUM `view` rows with the issue in `view_url` and nothing else about who
+/// clicked: no open pixel, no per-recipient token, the same link for everyone. The
+/// reader-analytics post promised exactly this much and no more.
+const ISSUE_PARAM: &str = "issue";
+
+/// `post_url` with the issue parameter, keeping any fragment where it was.
+pub fn tag_url(url: &str, issue: &str) -> String {
+    let (base, fragment) = match url.find('#') {
+        Some(i) => (&url[..i], &url[i..]),
+        None => (url, ""),
+    };
+    let sep = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{sep}{ISSUE_PARAM}={issue}{fragment}")
+}
+
+/// Rewrite the markdown link targets that point into the site: root-relative ones
+/// become absolute, since mail has no base URL to resolve `/blog/...` against, and
+/// every link to lindfors.no gets the issue parameter. Other hosts, mailto and
+/// anchors alone are left as they are; fenced code is masked first.
+pub fn tag_links(body: &str, issue: &str) -> String {
+    let (masked, spans) = crate::codemask::mask(body);
+    let mut out = String::with_capacity(masked.len() + 64);
+    let mut rest = masked.as_str();
+    while let Some(start) = rest.find("](") {
+        let target_start = start + 2;
+        let Some(len) = rest[target_start..].find(')') else { break };
+        let target = &rest[target_start..target_start + len];
+        out.push_str(&rest[..target_start]);
+        out.push_str(&retarget(target, issue));
+        rest = &rest[target_start + len..];
+    }
+    out.push_str(rest);
+    crate::codemask::unmask(&out, &spans)
+}
+
+fn retarget(target: &str, issue: &str) -> String {
+    // A title after the URL (`[x](url "title")`) rides along untouched.
+    let (url, title) = match target.find(' ') {
+        Some(i) => (&target[..i], &target[i..]),
+        None => (target, ""),
+    };
+    let absolute = if url.starts_with('/') && !url.starts_with("//") {
+        format!("{SITE_URL}{url}")
+    } else {
+        url.to_string()
+    };
+    let ours = absolute.starts_with(&format!("{SITE_URL}/")) || absolute == SITE_URL
+        || absolute.starts_with("https://www.lindfors.no/");
+    if ours {
+        format!("{}{title}", tag_url(&absolute, issue))
+    } else {
+        target.to_string()
+    }
 }
 
 /// Send a newsletter via the API.
@@ -225,3 +284,37 @@ pub fn send(slug: &str, subject: Option<&str>, catch_up: bool) -> Result<(), Str
 }
 
 use crate::util::{find_env_file, read_env_var};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_post_url_gets_the_issue_parameter() {
+        assert_eq!(tag_url("https://lindfors.no/blog/a/", "a"), "https://lindfors.no/blog/a/?issue=a");
+        assert_eq!(tag_url("https://lindfors.no/blog/a/#s", "a"), "https://lindfors.no/blog/a/?issue=a#s");
+        assert_eq!(tag_url("https://lindfors.no/x?y=1", "a"), "https://lindfors.no/x?y=1&issue=a");
+    }
+
+    #[test]
+    fn site_links_are_absolute_and_tagged_and_others_are_left_alone() {
+        let body = "See [part one](/blog/one/) and [the site](https://lindfors.no/) and \
+                    [a paper](https://doi.org/10.1/x) and [mail](mailto:a@b.c) and [here](#top).\n\
+                    Also [with title](/blog/two/ \"Two\").\n";
+        let out = tag_links(body, "issue-slug");
+        assert!(out.contains("[part one](https://lindfors.no/blog/one/?issue=issue-slug)"));
+        assert!(out.contains("[the site](https://lindfors.no/?issue=issue-slug)"));
+        assert!(out.contains("[a paper](https://doi.org/10.1/x)"));
+        assert!(out.contains("[mail](mailto:a@b.c)"));
+        assert!(out.contains("[here](#top)"));
+        assert!(out.contains("[with title](https://lindfors.no/blog/two/?issue=issue-slug \"Two\")"));
+    }
+
+    #[test]
+    fn links_inside_code_fences_are_not_touched() {
+        let body = "```md\n[x](/blog/one/)\n```\n\n[y](/blog/one/)\n";
+        let out = tag_links(body, "s");
+        assert!(out.contains("```md\n[x](/blog/one/)\n```"));
+        assert!(out.contains("[y](https://lindfors.no/blog/one/?issue=s)"));
+    }
+}
