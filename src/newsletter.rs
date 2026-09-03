@@ -7,6 +7,11 @@ use crate::frontmatter;
 
 const SITE_URL: &str = "https://lindfors.no";
 
+/// Where the newsletter service lives: the send is an operator action, so it is
+/// reached through the admin name, behind ADMIN_KEY, and never through the public
+/// newsletter.lindfors.no vhost, which routes only subscribe, confirm and unsubscribe.
+const ADMIN_URL: &str = "https://admin.lindfors.no";
+
 /// Clean markdown body for email: strip shortcodes, math blocks, etc.
 fn clean_body(body: &str) -> String {
     let mut result = String::with_capacity(body.len());
@@ -170,11 +175,11 @@ pub fn send(slug: &str, subject: Option<&str>) -> Result<(), String> {
         .args([
             // --fail-with-body, not bare -s. `curl -s` exits 0 on an HTTP 500, so a
             // send that the Worker rejected outright was reported here as success --
-            // and now that a send can *partially* fail (the Worker answers 502 with
+            // and now that a send can *partially* fail (the service answers 502 with
             // the addresses it could not reach), silently exiting 0 would hide the
             // one case that most needs a human. This still prints the body.
             "-s", "--fail-with-body", "-X", "POST",
-            &format!("{SITE_URL}/api/send-newsletter"),
+            &format!("{ADMIN_URL}/api/send-newsletter"),
             "-H", &format!("Authorization: Bearer {admin_key}"),
             "-H", "Content-Type: application/json",
             "-d", &body,
@@ -194,7 +199,7 @@ pub fn send(slug: &str, subject: Option<&str>) -> Result<(), String> {
     }
 
     if !output.status.success() {
-        // The body is already printed above and carries the Worker's own explanation --
+        // The body is already printed above and carries the service's own explanation --
         // a 409 from the send log says the issue was sent and how to clear the claim.
         // Repeating curl's exit code alone would bury that.
         return Err(format!(
@@ -207,121 +212,3 @@ pub fn send(slug: &str, subject: Option<&str>) -> Result<(), String> {
 }
 
 use crate::util::{find_env_file, read_env_var};
-
-/// Verify that the send log's compare-and-swap actually works, without sending mail.
-///
-/// The whole idempotency guard rests on one behaviour: Stalwart answering a `PUT` with
-/// `If-None-Match: *` with 412 when the file is already there. That is a claim about
-/// someone else's server, it is only exercised on a real send, and the cost of it being
-/// wrong is mailing everyone twice. So it gets a probe that can be run on demand — after
-/// a Stalwart upgrade, or the first time the collection is set up.
-///
-/// Writes and deletes one throwaway file. Nothing is sent.
-pub fn check_sendlog() -> Result<(), String> {
-    let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {e}"))?;
-    let env_path = find_env_file(&cwd)?;
-
-    let base = read_env_var(&env_path, "SEND_LOG_URL")?;
-    let user = read_env_var(&env_path, "JMAP_LIST_USER")?;
-    let password = read_env_var(&env_path, "JMAP_LIST_PASSWORD")?;
-
-    if user.is_empty() || password.is_empty() {
-        return Err(format!(
-            "JMAP_LIST_USER and JMAP_LIST_PASSWORD must be set in {} to run this check",
-            env_path.display()
-        ));
-    }
-
-    let base = base.trim_end_matches('/');
-    let slug = "zz-sendlog-probe";
-    let url = format!("{base}/{slug}.json");
-
-    println!("Send log: {base}");
-    println!();
-
-    // 1. Claim a slug nothing has claimed.
-    let first = dav(&url, "PUT", &user, &password, Some(r#"{"probe":true}"#), true)?;
-    report("claim an unused slug", &["201", "204"], &first);
-
-    // 2. The same claim again. This is the one that matters.
-    let second = dav(&url, "PUT", &user, &password, Some(r#"{"probe":true}"#), true)?;
-    report("refuse a slug already claimed", &["412"], &second);
-
-    // 3. Clean up, so the probe can run again.
-    let cleanup = dav(&url, "DELETE", &user, &password, None, false)?;
-    report("delete the probe file", &["200", "204"], &cleanup);
-
-    println!();
-    let ok = matches!(first.as_str(), "201" | "204")
-        && second == "412"
-        && matches!(cleanup.as_str(), "200" | "204");
-
-    if ok {
-        println!("Send log is working: a second claim on the same slug is refused.");
-        Ok(())
-    } else {
-        Err("Send log did not behave as the Worker expects. A send would be \
-             unguarded, or refused outright — see the statuses above."
-            .to_string())
-    }
-}
-
-/// One authenticated request to the send log. Returns the HTTP status as a string.
-fn dav(
-    url: &str,
-    method: &str,
-    user: &str,
-    password: &str,
-    body: Option<&str>,
-    if_none_match: bool,
-) -> Result<String, String> {
-    // curl writes the body somewhere and the status to stdout. `/dev/null` is not a
-    // path on Windows, and `-s` hides the error it produces, so this silently failed
-    // with an empty message until it was pinned to the platform's null device.
-    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
-
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        // Status only: the body is not interesting, and a 412 is an expected outcome
-        // here rather than an error, so --fail would be exactly wrong.
-        "-s", "-o", null_device, "-w", "%{http_code}",
-        "-X", method,
-        "-u", &format!("{user}:{password}"),
-        url,
-    ]);
-    if if_none_match {
-        cmd.args(["-H", "If-None-Match: *"]);
-    }
-    if let Some(body) = body {
-        cmd.args(["-H", "Content-Type: application/json", "-d", body]);
-    }
-
-    let output = cmd.output().map_err(|e| format!("Failed to run curl: {e}"))?;
-    if !output.status.success() {
-        // The exit code matters when stderr is empty, which `-s` makes common.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        return Err(if detail.is_empty() {
-            format!("curl exited with {} and said nothing", output.status)
-        } else {
-            format!("curl failed: {detail}")
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn report(what: &str, want: &[&str], got: &str) {
-    let ok = want.contains(&got);
-    println!(
-        "  [{}] {what}  (wanted {}, got {got})",
-        if ok { "ok" } else { "FAIL" },
-        want.join(" or "),
-    );
-    if !ok && (got == "401" || got == "403") {
-        println!("        JMAP_LIST_USER does not have DAV access to this collection.");
-    }
-    if !ok && got == "409" {
-        println!("        The collection does not exist yet. The Worker MKCOLs it on");
-        println!("        first send; create it by hand to probe first.");
-    }
-}
