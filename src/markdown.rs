@@ -185,6 +185,9 @@ struct PostRef {
     title: String,
     description: String,
     date: String,
+    tags: Vec<String>,
+    series: Option<String>,
+    og_image: Option<String>,
 }
 
 /// Generate `static/blog/<slug>.md` for one post. Drafts are skipped.
@@ -230,6 +233,9 @@ fn gen_inner(post_path: &str) -> Result<Option<PostRef>, String> {
         title: fm.title,
         description: fm.description,
         date: fm.date,
+        tags: fm.tags,
+        series: fm.series,
+        og_image: fm.og_image,
     }))
 }
 
@@ -264,6 +270,50 @@ pub fn gen_all() -> Result<(), String> {
     prune(&root, &posts)?;
     write_llms_txt(&root, &published)?;
     write_recent_json(&root, &published)?;
+    write_posts_json(&root, &published)?;
+    Ok(())
+}
+
+/// `static/posts.json`: every published post with what a promotion needs to route
+/// it -- tags, series, the share image -- for the promotion desk (lindfors-promo) to
+/// mirror. `recent.json` stays what the welcome mail reads; this is the whole
+/// catalogue, and it carries more per post. Same hand-rolled JSON as its sibling.
+fn write_posts_json(root: &Path, posts: &[PostRef]) -> Result<(), String> {
+    let mut out = String::from("[
+");
+    for (i, post) in posts.iter().enumerate() {
+        if i > 0 {
+            out.push_str(",
+");
+        }
+        let tags: Vec<String> = post.tags.iter().map(|t| json_string(t)).collect();
+        // The share image rule from page.html: extra.og_image if set, else the card
+        // `og all` writes for every published post.
+        let og_image = post
+            .og_image
+            .clone()
+            .unwrap_or_else(|| format!("/og/{}.png", post.slug));
+        out.push_str(&format!(
+            "  {{\"slug\": {}, \"title\": {}, \"url\": {}, \"date\": {}, \"description\": {}, \"tags\": [{}], \"series\": {}, \"og_image\": {}}}",
+            json_string(&post.slug),
+            json_string(&post.title),
+            json_string(&format!("{SITE_URL}/blog/{}/", post.slug)),
+            // A TOML date may carry a time; the day is what the desk keys off.
+            json_string(&post.date[..post.date.len().min(10)]),
+            json_string(&post.description),
+            tags.join(", "),
+            post.series.as_deref().map(json_string).unwrap_or_else(|| "null".to_string()),
+            json_string(&format!("{SITE_URL}{og_image}")),
+        ));
+    }
+    out.push_str("
+]
+");
+
+    let out_path = root.join("static/posts.json");
+    fs::write(&out_path, &out)
+        .map_err(|e| format!("Failed to write {}: {e}", out_path.display()))?;
+    println!("Posts: {} ({} posts)", out_path.display(), posts.len());
     Ok(())
 }
 
@@ -521,6 +571,8 @@ mod tests {
             featured_image: None,
             draft: false,
             tags: vec!["rust".into(), "zola".into()],
+            series: None,
+            og_image: None,
         };
         let doc = render(&fm, "\n## Section\n\nBody.\n", "a-post", None);
 

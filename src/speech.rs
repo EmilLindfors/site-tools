@@ -923,6 +923,8 @@ mod tests {
                 featured_image: None,
                 draft: false,
                 tags: vec![],
+                series: None,
+                og_image: None,
             },
             "Osmundsen et al. describe it.\n",
             &[],
@@ -1081,6 +1083,8 @@ mod tests {
             featured_image: None,
             draft: false,
             tags: vec![],
+            series: None,
+            og_image: None,
         };
         let script = render(&fm, "\n## Section\n\nBody.\n", &[]);
 
@@ -1099,6 +1103,8 @@ mod tests {
             featured_image: None,
             draft: false,
             tags: vec![],
+            series: None,
+            og_image: None,
         };
         let script = render(&fm, "First.\n\n## A heading\n\nSecond.\n", &[]);
 

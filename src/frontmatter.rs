@@ -9,6 +9,10 @@ pub struct Frontmatter {
     /// Zola treats a missing `draft` as published.
     pub draft: bool,
     pub tags: Vec<String>,
+    /// `series` under `[taxonomies]`; a post is in at most one.
+    pub series: Option<String>,
+    /// `extra.og_image`, an override for the share image; the default is `/og/<slug>.png`.
+    pub og_image: Option<String>,
 }
 
 /// Split a Zola markdown file on `+++` delimiters.
@@ -132,6 +136,22 @@ pub fn parse(content: &str) -> Result<Frontmatter, String> {
         })
         .unwrap_or_default();
 
+    let series = table
+        .get("taxonomies")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("series"))
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let og_image = table
+        .get("extra")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("og_image"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     Ok(Frontmatter {
         title,
         date,
@@ -139,6 +159,8 @@ pub fn parse(content: &str) -> Result<Frontmatter, String> {
         featured_image,
         draft,
         tags,
+        series,
+        og_image,
     })
 }
 
