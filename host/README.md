@@ -98,14 +98,16 @@ already allows; nothing else on the host changes.
 ```sh
 ./tools/site-tools/build-host.sh
 scp tools/site-tools/target/aarch64-unknown-linux-musl/release/site-tools \
-    tools/site-tools/host/lindfors-publisher.toml newsletter/send-issue hetzner:/tmp/
+    tools/site-tools/host/lindfors-publisher.toml \
+    ../lindfors-services/crates/lindfors-newsletter/send-issue hetzner:/tmp/
 ```
 
 `/tmp/lindfors-newsletter` on the box is a directory left from the cutover, so the
 newsletter binary has to be copied under another name, e.g. `/tmp/lindfors-newsletter.bin`.
 
 The newsletter binary needs its `send` command too, which arrived with it in the same
-change: `./newsletter/build.sh`, copy, `rc-service lindfors-newsletter restart`.
+change. The service is in the lindfors-services repo since 2026-09-07: `./build.sh
+newsletter` there, copy, `rc-service lindfors-newsletter restart`.
 
 ## Day to day
 

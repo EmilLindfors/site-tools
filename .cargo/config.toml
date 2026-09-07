@@ -1,5 +1,5 @@
 # Cross-compiling to the host (Alpine, aarch64, musl) with nothing installed but a
-# rustup target. Same arrangement as newsletter/.cargo/config.toml: the target is
+# rustup target. Same arrangement as lindfors-services' .cargo/config.toml: the target is
 # statically linked against the musl that rustup's rust-std ships, and rust-lld links
 # it, so no cross C toolchain is needed.
 #

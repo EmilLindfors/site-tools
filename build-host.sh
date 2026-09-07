@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build site-tools for the host it publishes from: mail.lindfors.no, Alpine on aarch64,
-# musl libc. Same arrangement as newsletter/build.sh, and for the same reason: without
+# musl libc. Same arrangement as lindfors-services' build.sh, and for the same reason: without
 # the `cite` feature the binary carries no C, so a rustup target and rust-lld are the
 # whole toolchain (see .cargo/config.toml).
 #
