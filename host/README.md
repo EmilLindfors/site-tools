@@ -1,11 +1,14 @@
 # The publisher on mail.lindfors.no
 
-Posts written ahead do not sit in the repo, which is public. They sit in a queue on the
-box, and `site-tools publish`, run there every hour from cron as the `publisher`
-account, moves the next one into a clone of the site on its week's slot: dates it,
-drops `draft`, makes the derived files, commits, pushes, waits for the page, and hands
-the slug to the newsletter binary over loopback. The workstation end is
-`site-tools schedule`. The rules are in `src/publish.rs`; this file is the install.
+Posts written ahead do not sit in this repo, which is public. They sit in `queue/` of
+the private lindfors-services repo, which the box holds as a clone, and `site-tools
+publish`, run there every hour from cron as the `publisher` account, moves the next one
+into a clone of the site on its week's slot: dates it, drops `draft`, makes the derived
+files, commits, pushes, removes the entry from the queue with a commit of its own, waits
+for the page, and hands the slug to the newsletter binary over loopback. The workstation
+end is `site-tools schedule`, which writes into the lindfors-services checkout beside
+this one; the push is the queueing. The rules are in `src/publish.rs`; this file is
+the install.
 
 ## What is where on the host
 
@@ -13,10 +16,10 @@ the slug to the newsletter binary over loopback. The workstation end is
 |---|---|---|
 | The binary, built without `cite` | `/opt/lindfors-publisher/site-tools` | root, 0755 |
 | Config: cadence, paths, the send command | `/etc/lindfors-publisher.toml` | root, 0644 |
-| The queue `schedule` fills | `/srv/lindfors-publisher/queue/<slug>/` | publisher |
-| Published entries, kept | `/srv/lindfors-publisher/published/<slug>/` | publisher |
+| A clone of lindfors-services, pushable; `queue/` in it is the queue | `/srv/lindfors-publisher/services/` | publisher |
 | A clone of the site, pushable | `/srv/lindfors-publisher/site/` | publisher |
-| Deploy key, write access, this repo only | `/srv/lindfors-publisher/.ssh/id_ed25519` | publisher, 0600 |
+| Deploy key, write access, the site repo | `/srv/lindfors-publisher/.ssh/id_ed25519` | publisher, 0600 |
+| Deploy key, write access, lindfors-services | `/srv/lindfors-publisher/.ssh/id_services` | publisher, 0600 |
 | Fonts for the PDFs | `/srv/lindfors-publisher/site/fonts/` | publisher (gitignored) |
 | The one root command it may run | `/opt/lindfors-newsletter/send-issue` | root, 0755 |
 | Log | `/var/log/lindfors-publisher/publish.log` | publisher |
@@ -31,7 +34,6 @@ through a sudoers line that allows exactly that command.
 addgroup -S publisher
 adduser -S -D -h /srv/lindfors-publisher -s /bin/sh -G publisher publisher
 install -d -o publisher -g publisher -m 0750 /srv/lindfors-publisher
-install -d -o publisher -g publisher -m 0750 /srv/lindfors-publisher/queue /srv/lindfors-publisher/published
 install -d -o publisher -g publisher -m 0755 /var/log/lindfors-publisher
 install -d -m 0755 /opt/lindfors-publisher
 
@@ -78,9 +80,40 @@ bash scripts/fetch-fonts.sh
 EOS
 ```
 
-`fetch-fonts.sh` has no exec bit in git, hence `bash`. The last line proves the config
-parses, the clone reads, and the queue is empty. Done on 2026-09-03; the deploy key
-was added from the workstation with `gh repo deploy-key add <pubkey> --allow-write`.
+`fetch-fonts.sh` has no exec bit in git, hence `bash`. Done on 2026-09-03; the deploy
+key was added from the workstation with `gh repo deploy-key add <pubkey> --allow-write`.
+
+The queue is a second clone with a second key, so a key that leaks opens one repo and
+not both. The `Host` alias in `.ssh/config` is what `git` picks the key by; the clone
+uses that alias as its remote host.
+
+```sh
+su -s /bin/sh publisher <<'EOS'
+cd ~
+ssh-keygen -t ed25519 -N '' -C 'lindfors-publisher-services@mail.lindfors.no' -f .ssh/id_services
+printf 'Host github-services\n  HostName github.com\n  IdentityFile ~/.ssh/id_services\n  IdentitiesOnly yes\n' >> .ssh/config
+chmod 0600 .ssh/config
+cat .ssh/id_services.pub
+EOS
+```
+
+From the workstation, in the lindfors-services checkout:
+`gh repo deploy-key add <pubkey file> --allow-write --title mail.lindfors.no-publisher`.
+Then, as `publisher`:
+
+```sh
+su -s /bin/sh publisher <<'EOS'
+cd ~
+git clone git@github-services:EmilLindfors/lindfors-services.git services
+git -C services config user.name  "lindfors-publisher"
+git -C services config user.email "publisher@lindfors.no"
+/opt/lindfors-publisher/site-tools publish list
+EOS
+```
+
+The last line proves both clones read and shows the queue as pushed. Done on
+2026-09-07, when the queue moved off `/srv/lindfors-publisher/queue` (removed) into
+the repo.
 
 ```sh
 # 6. Cron: every hour, as publisher. busybox crond reads /etc/crontabs/<user>.
@@ -115,9 +148,12 @@ newsletter` there, copy, `rc-service lindfors-newsletter restart`.
 site-tools schedule <slug>                    # next free week; --week 2026-W41 pins one
 site-tools schedule <slug> --no-send          # publish without an issue
 site-tools schedule <slug> --twir             # and submit it to This Week in Rust
-site-tools schedule list                      # the queue, and what the next run picks
+site-tools schedule list                      # the queue, marking what is not pushed yet
 site-tools schedule remove <slug>
 ```
+
+Each of those changes `../lindfors-services/queue/` (or `QUEUE_DIR`) and prints the
+`git` line that makes it count: the box sees the queue as last pushed, nothing else.
 
 `--twir` costs the box nothing: the publish commit gets a `Syndicate: this-week-in-rust`
 trailer and the repo's `twir` workflow opens the pull request on the push, with the
@@ -129,15 +165,21 @@ On the box, the same binary answers `publish next` (a dry run), `publish run --n
 
 A post is queued when it is finished: linted, cited (`site-tools cite all`; `schedule`
 refuses a post with a marker left), hero and card made, `draft = true` still set. The
-publisher removes the flag, sets `date` to the day it runs, and archives the entry after
-the push. `git pull` afterwards replaces the local draft with the published copy at the
-same path.
+publisher removes the flag, sets `date` to the day it runs, and after the push removes
+the entry from the queue with a commit (`Published: <slug>`) pushed to
+lindfors-services. `git pull` in both checkouts afterwards: the site gets the published
+copy at the same path as the local draft, the services repo loses the entry.
 
 ## What can go wrong
 
 - **The push fails** (someone pushed at the same moment, the key is gone): the run
   exits non-zero, the entry stays queued, nothing is mailed, and the next hour's run
-  resets the clone and tries again.
+  resets the clones and tries again.
+- **The site push succeeds and the queue push fails**: the run exits non-zero naming
+  the entry, and nothing is mailed. The next run sees the slug as a dated post in the
+  site clone and refuses to publish it again, printing that it should be removed from
+  the queue: `site-tools schedule remove <slug>` on the workstation, commit, push. The
+  issue then goes by hand, as below.
 - **The page never answers 200** within `wait_minutes`: the post is published and
   archived, the mail is not sent, and the log says to send by hand:
   `sudo /opt/lindfors-newsletter/send-issue <slug>`. The `sends` table stops a double.

@@ -10,9 +10,12 @@
 # in it survives except what is ignored (fonts/).
 repo = "/srv/lindfors-publisher/site"
 
-# Where `site-tools schedule` puts a post, and where a published one is moved to.
-queue = "/srv/lindfors-publisher/queue"
-archive = "/srv/lindfors-publisher/published"
+# A clone of the private lindfors-services repo, pushable with a second deploy key.
+# Its `queue/` is the queue: `site-tools schedule` on the workstation puts an entry
+# there and a push queues it. Every run resets this clone to the remote too, and a
+# publish removes the entry with a commit pushed back, so the repo's history is the
+# record of what went out. `queue` defaults to `<queue_repo>/queue`.
+queue_repo = "/srv/lindfors-publisher/services"
 
 # The weekly slot. The run every hour does nothing before it, and after it publishes
 # the next queued post unless the week already has one. Weekends are simply not the

@@ -1,38 +1,30 @@
-//! Hand a finished post to the publishing queue on mail.lindfors.no.
+//! Hand a finished post to the publishing queue.
 //!
-//! The repo is public, so a post that is written but not yet out cannot sit in it, not
-//! even as a draft. The queue is a directory of page bundles on the box that already
-//! holds the newsletter's state, and `site-tools publish` there moves one into the
-//! site on its day (see `publish.rs`). This is the workstation end: it stages the
-//! bundle, its audio and speech files if they exist, and a `schedule.toml` sidecar,
-//! and streams them over ssh into the queue as the `publisher` account.
+//! The site repo is public, so a post that is written but not yet out cannot sit in it,
+//! not even as a draft. The queue is `queue/` in the private lindfors-services repo,
+//! checked out beside this one: one directory per post holding `post/` (the page
+//! bundle), `static/` (audio and speech files, if any) and a `schedule.toml` sidecar.
+//! Committing and pushing that repo is what queues the post; the publisher on
+//! mail.lindfors.no keeps a clone of it and `site-tools publish` there moves one entry
+//! into the site on its day, then removes it from the queue with a commit of its own
+//! (see `publish.rs`). This is the workstation end: it stages the entry into the queue
+//! directory and says what to commit.
 //!
-//! Nothing here touches the local copy. `git pull` after the publish overwrites it
-//! with the published one at the same path.
+//! Nothing here touches the local copy of the post. `git pull` after the publish
+//! overwrites it with the published one at the same path.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::{codemask, frontmatter, markers, util};
+use crate::{codemask, frontmatter, markers, publish, util};
 
-/// Where the queue is. Every value is overridable from the environment or `.env`.
-pub struct Remote {
-    pub host: String,
-    pub user: String,
-    pub queue: String,
-    pub bin: String,
-}
-
-impl Remote {
-    fn from_settings(root: &Path) -> Remote {
-        let get = |key: &str, default: &str| util::setting(root, key).unwrap_or_else(|| default.to_string());
-        Remote {
-            host: get("PUBLISH_HOST", "hetzner"),
-            user: get("PUBLISH_USER", "publisher"),
-            queue: get("PUBLISH_QUEUE", "/srv/lindfors-publisher/queue"),
-            bin: get("PUBLISH_BIN", "/opt/lindfors-publisher/site-tools"),
-        }
+/// The queue directory, `QUEUE_DIR` in the environment or `.env`; otherwise the
+/// lindfors-services checkout beside the site.
+pub fn queue_dir(root: &Path) -> PathBuf {
+    match util::setting(root, "QUEUE_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => root.parent().map(|p| p.join("lindfors-services")).unwrap_or_else(|| root.join("..")).join("queue"),
     }
 }
 
@@ -44,44 +36,44 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {e}"))?;
     let root = util::find_project_root(&cwd)?;
-    let remote = Remote::from_settings(&root);
+    let queue = queue_dir(&root);
 
     match first.as_str() {
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
         }
-        "list" => remote_publish(&remote, &["list"]),
+        "list" => list(&queue),
         "remove" | "unschedule" => {
             let slug = args.get(1).ok_or("Usage: site-tools schedule remove <slug>")?;
             check_slug(slug)?;
-            remote_publish(&remote, &["unqueue", slug])
+            remove(&queue, slug)
         }
         slug => {
             let week = crate::parse_flag(&args[1..], "--week");
             let subject = crate::parse_flag(&args[1..], "--subject");
             let send = !args[1..].iter().any(|a| a == "--no-send");
             let twir = args[1..].iter().any(|a| a == "--twir");
-            add(&root, &remote, slug, week.as_deref(), subject.as_deref(), send, twir)
+            add(&root, &queue, slug, week.as_deref(), subject.as_deref(), send, twir)
         }
     }
 }
 
 fn print_usage() {
-    eprintln!("site-tools schedule — Queue a post for publishing on the box");
+    eprintln!("site-tools schedule — Queue a post for publishing");
     eprintln!();
     eprintln!("Subcommands:");
     eprintln!("  <slug> [--week YYYY-Www] [--no-send] [--subject ...] [--twir]");
-    eprintln!("                    Copy content/blog/<slug>/ and its audio to the queue");
+    eprintln!("                    Copy content/blog/<slug>/ and its audio into the queue");
     eprintln!("                    --twir: submit it to This Week in Rust when it goes out");
-    eprintln!("  list              What is queued, and what the next run would do");
+    eprintln!("  list              What is queued, and what is not yet committed");
     eprintln!("  remove <slug>     Take a post back out of the queue");
     eprintln!();
     eprintln!("The post must be a draft with its citations resolved. No --week means the");
-    eprintln!("next free slot, in the order things were queued.");
+    eprintln!("next free slot, in the order things were queued. The queue is the queue/");
+    eprintln!("directory of the lindfors-services repo; commit and push it to queue the post.");
     eprintln!();
-    eprintln!("Settings (environment or .env): PUBLISH_HOST (hetzner), PUBLISH_USER (publisher),");
-    eprintln!("PUBLISH_QUEUE (/srv/lindfors-publisher/queue), PUBLISH_BIN (/opt/lindfors-publisher/site-tools)");
+    eprintln!("Settings (environment or .env): QUEUE_DIR (../lindfors-services/queue)");
 }
 
 fn check_slug(slug: &str) -> Result<(), String> {
@@ -124,11 +116,31 @@ fn toml_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn add(root: &Path, remote: &Remote, slug: &str, week: Option<&str>, subject: Option<&str>, send: bool, twir: bool) -> Result<(), String> {
+/// The queue directory must be inside a checkout: the commit is the queueing.
+/// Returns the checkout's root.
+fn check_queue(queue: &Path) -> Result<PathBuf, String> {
+    let repo = queue.parent().ok_or_else(|| format!("{} has no parent", queue.display()))?;
+    if !repo.join(".git").exists() {
+        return Err(format!(
+            "{} is not inside a git checkout. Clone lindfors-services beside the site, or set QUEUE_DIR.",
+            shown(queue)
+        ));
+    }
+    fs::canonicalize(repo).map_err(|e| format!("Failed to resolve {}: {e}", repo.display()))
+}
+
+/// A path for a message: Windows' canonical `\\?\` prefix does not belong in one.
+fn shown(path: &Path) -> String {
+    let text = path.display().to_string();
+    text.strip_prefix(r"\\?\").map(String::from).unwrap_or(text)
+}
+
+fn add(root: &Path, queue: &Path, slug: &str, week: Option<&str>, subject: Option<&str>, send: bool, twir: bool) -> Result<(), String> {
     check_slug(slug)?;
     if let Some(week) = week {
-        crate::publish::parse_week(week)?;
+        publish::parse_week(week)?;
     }
+    let repo = check_queue(queue)?;
 
     let bundle = root.join("content/blog").join(slug);
     let index = bundle.join("index.md");
@@ -170,12 +182,12 @@ fn add(root: &Path, remote: &Remote, slug: &str, week: Option<&str>, subject: Op
     let queued_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let sidecar = sidecar(slug, &fm.title, &queued_at, week, subject, send, twir);
 
-    // Stage the entry as the queue will hold it: post/, static/, schedule.toml.
-    let staging = std::env::temp_dir().join(format!("site-tools-schedule-{slug}"));
-    if staging.exists() {
-        fs::remove_dir_all(&staging).map_err(|e| format!("Failed to clean {}: {e}", staging.display()))?;
+    // The entry as the queue holds it: post/, static/, schedule.toml. A re-queue
+    // replaces the old copy whole instead of merging into it.
+    let entry = queue.join(slug);
+    if entry.exists() {
+        fs::remove_dir_all(&entry).map_err(|e| format!("Failed to clear {}: {e}", entry.display()))?;
     }
-    let entry = staging.join(slug);
     copy_dir(&bundle, &entry.join("post"))?;
     let mut extras = Vec::new();
     for rel in [
@@ -193,7 +205,7 @@ fn add(root: &Path, remote: &Remote, slug: &str, week: Option<&str>, subject: Op
     }
     fs::write(entry.join("schedule.toml"), &sidecar).map_err(|e| format!("Failed to write the sidecar: {e}"))?;
 
-    println!("Queueing {slug}: {}", fm.title);
+    println!("Queued {slug}: {}", fm.title);
     match week {
         Some(w) => println!("  week: {w}"),
         None => println!("  week: next free slot"),
@@ -203,78 +215,79 @@ fn add(root: &Path, remote: &Remote, slug: &str, week: Option<&str>, subject: Op
     for rel in &extras {
         println!("  with {rel}");
     }
-    println!("  to {}@{}:{}/{slug}", remote.user, remote.host, remote.queue);
-
-    // tar | ssh sudo -u publisher tar. Two processes rather than scp, so the entry
-    // lands owned by the account that will move it, and a re-queue replaces the old
-    // copy whole instead of merging into it.
-    let mut tar = Command::new("tar")
-        .args(["-cf", "-", slug])
-        .current_dir(&staging)
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run tar: {e}"))?;
-    let tar_out = tar.stdout.take().unwrap();
-
-    let script = "set -e; mkdir -p \"$1\"; rm -rf \"$1/$2\"; tar -xf - -C \"$1\"";
-    let remote_cmd = format!(
-        "sudo -u {} sh -c '{}' sh {} {}",
-        shell_word(&remote.user)?,
-        script,
-        shell_word(&remote.queue)?,
-        slug
-    );
-    let status = Command::new("ssh")
-        .arg(&remote.host)
-        .arg(&remote_cmd)
-        .stdin(Stdio::from(tar_out))
-        .status()
-        .map_err(|e| format!("Failed to run ssh: {e}"))?;
-    let tar_status = tar.wait().map_err(|e| format!("tar did not finish: {e}"))?;
-    let _ = fs::remove_dir_all(&staging);
-
-    if !tar_status.success() {
-        return Err(format!("tar failed with {tar_status}"));
-    }
-    if !status.success() {
-        return Err(format!("ssh to {} failed with {status}", remote.host));
-    }
-
-    println!("Queued. `site-tools schedule list` shows the queue and the next run's pick.");
+    println!("  in {}", shown(&entry));
+    println!();
+    println!("It is queued once it is pushed:");
+    let r = shown(&repo);
+    println!("  git -C {r} add queue/{slug} && git -C {r} commit -m 'Queue: {slug}' && git -C {r} push");
     Ok(())
 }
 
-/// Run `site-tools publish <args>` on the box as the publisher account and stream
-/// its output back.
-fn remote_publish(remote: &Remote, args: &[&str]) -> Result<(), String> {
-    let mut cmd = format!("sudo -u {} {}", shell_word(&remote.user)?, shell_word(&remote.bin)?);
-    cmd.push_str(" publish");
-    for a in args {
-        cmd.push(' ');
-        cmd.push_str(&shell_word(a)?);
+fn remove(queue: &Path, slug: &str) -> Result<(), String> {
+    let repo = check_queue(queue)?;
+    let entry = queue.join(slug);
+    if !entry.join("schedule.toml").is_file() {
+        return Err(format!("{slug} is not in the queue ({})", shown(queue)));
     }
-    let status = Command::new("ssh")
-        .arg(&remote.host)
-        .arg(&cmd)
-        .status()
-        .map_err(|e| format!("Failed to run ssh: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("ssh to {} failed with {status}", remote.host))
-    }
+    fs::remove_dir_all(&entry).map_err(|e| format!("Failed to remove {}: {e}", entry.display()))?;
+    println!("Removed {slug} from {}.", shown(queue));
+    println!("It is out of the queue once that is pushed:");
+    let r = shown(&repo);
+    println!("  git -C {r} add -A queue && git -C {r} commit -m 'Unqueue: {slug}' && git -C {r} push");
+    Ok(())
 }
 
-/// A word safe to hand to a remote `sh` unquoted. Paths and account names here are
-/// plain; anything else is refused rather than escaped.
-fn shell_word(s: &str) -> Result<String, String> {
-    let ok = !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '@' | ':'));
-    if ok {
-        Ok(s.to_string())
-    } else {
-        Err(format!("{s:?} contains characters this tool will not pass to a shell"))
+/// The queue as the checkout holds it, with a mark on what the box cannot see yet.
+fn list(queue: &Path) -> Result<(), String> {
+    let repo = check_queue(queue)?;
+    let entries = publish::read_queue(queue)?;
+    let pending = uncommitted(&repo, queue);
+    println!("Queue ({}):", shown(queue));
+    if entries.is_empty() {
+        println!("  (empty)");
     }
+    for e in &entries {
+        println!(
+            "  {:<40} {:<16} {}  {}  queued {}{}{}",
+            e.slug,
+            e.slot_text(),
+            if e.send { "newsletter" } else { "no mail   " },
+            if e.twir { "twir" } else { "    " },
+            e.queued_at,
+            e.subject.as_ref().map(|s| format!("  subject: {s}")).unwrap_or_default(),
+            if pending.iter().any(|p| p == &e.slug) { "  NOT PUSHED" } else { "" }
+        );
+    }
+    if !pending.is_empty() {
+        println!();
+        println!("NOT PUSHED: changed here, not yet in a commit the box can see.");
+    }
+    println!();
+    println!("The box publishes the first pinned entry whose week has come, else the oldest");
+    println!("unpinned one, after the week's slot (Tuesday 08:00 Oslo), one a week.");
+    Ok(())
+}
+
+/// Slugs under the queue with uncommitted changes, or not tracked at all.
+fn uncommitted(repo: &Path, queue: &Path) -> Vec<String> {
+    let rel = queue.strip_prefix(repo).map(|p| p.to_path_buf()).unwrap_or_else(|_| PathBuf::from("queue"));
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all", "--"])
+        .arg(&rel)
+        .current_dir(repo)
+        .output();
+    let Ok(output) = output else { return Vec::new() };
+    let prefix = format!("{}/", rel.to_string_lossy().replace('\\', "/"));
+    let mut slugs: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .filter_map(|path| path.strip_prefix(&prefix))
+        .filter_map(|rest| rest.split('/').next())
+        .map(String::from)
+        .collect();
+    slugs.sort();
+    slugs.dedup();
+    slugs
 }
 
 fn tracked_in_git(root: &Path, dir: &Path) -> bool {
@@ -332,12 +345,18 @@ mod tests {
     }
 
     #[test]
-    fn slugs_and_shell_words_are_checked() {
+    fn slugs_are_checked() {
         assert!(check_slug("newsletter-on-my-own-server").is_ok());
         assert!(check_slug("Bad Slug").is_err());
         assert!(check_slug("../etc").is_err());
-        assert!(shell_word("/srv/lindfors-publisher/queue").is_ok());
-        assert!(shell_word("a b").is_err());
-        assert!(shell_word("x;rm").is_err());
+        assert!(check_slug("").is_err());
+    }
+
+    #[test]
+    fn the_queue_defaults_to_the_services_checkout_beside_the_site() {
+        // No QUEUE_DIR in this test's environment or the site's .env.
+        std::env::remove_var("QUEUE_DIR");
+        let root = Path::new("/home/me/dev/lindfors-site");
+        assert_eq!(queue_dir(root), PathBuf::from("/home/me/dev/lindfors-services/queue"));
     }
 }

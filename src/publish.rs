@@ -1,9 +1,11 @@
 //! Publish the next queued post. Runs on mail.lindfors.no as the `publisher` account,
 //! from cron, against a clone of the site repo it can push to with a deploy key.
 //!
-//! The queue is `schedule.rs`'s output: one directory per post under the queue root,
-//! holding `post/` (the page bundle), `static/` (audio and speech files, if any) and a
-//! `schedule.toml` sidecar. A run is one decision and one sequence:
+//! The queue is `queue/` in the private lindfors-services repo, which the box holds as
+//! a second clone with its own deploy key: one directory per post, holding `post/`
+//! (the page bundle), `static/` (audio and speech files, if any) and a `schedule.toml`
+//! sidecar, put there by `schedule.rs` on the workstation and pushed. A run is one
+//! decision and one sequence:
 //!
 //! - *Is it time?* The config names a weekday, an hour and a time zone. The slot for the
 //!   current ISO week is that moment; before it, nothing happens. After it, the run
@@ -12,11 +14,14 @@
 //!   own, and what stops a second post going out in a week someone published by hand.
 //! - *Which post?* An entry pinned to this week or an earlier one, oldest pin first;
 //!   otherwise the earliest queued entry with no pin. Entries pinned to a later week wait.
-//! - *The sequence.* Reset the clone to the remote branch, move the bundle in, write
-//!   today's date into its frontmatter and drop `draft`, generate the derived files the
-//!   build would, commit, push. Then, if the sidecar says so, wait for the page to answer
-//!   200 and hand the slug to the newsletter binary over loopback. Every step fails
-//!   closed: a failed push mails nobody, and the next run starts from the remote again.
+//! - *The sequence.* Reset both clones to their remote branches, move the bundle in,
+//!   write today's date into its frontmatter and drop `draft`, generate the derived
+//!   files the build would, commit, push. Take the entry out of the queue with a commit
+//!   pushed to the queue's repo. Then, if the sidecar says so, wait for the page to
+//!   answer 200 and hand the slug to the newsletter binary over loopback. Every step
+//!   fails closed: a failed push mails nobody, and the next run starts from the remotes
+//!   again. A slug the site already carries as a dated post is never published twice,
+//!   whatever the queue says, which covers a queue push that failed after a site push.
 //!
 //! `date` is assigned here, not by the author. Series order is the date, so it is
 //! publish order, and two posts in a series can never share one.
@@ -36,9 +41,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct Config {
     pub repo: PathBuf,
+    /// The clone of lindfors-services the queue lives in, reset to its remote before
+    /// every read and pushed to after every publish; the audit trail is its history.
+    pub queue_repo: PathBuf,
+    /// The queue directory inside it.
     pub queue: PathBuf,
-    /// Where a published entry is moved to, so the run leaves an audit trail.
-    pub archive: PathBuf,
     pub weekday: Weekday,
     pub hour: u32,
     pub minute: u32,
@@ -82,17 +89,17 @@ impl Config {
             return Err("config: send_command is empty".to_string());
         }
 
-        let queue = PathBuf::from(s("queue", "/srv/lindfors-publisher/queue"));
-        let archive = table
-            .get("archive")
+        let queue_repo = PathBuf::from(s("queue_repo", "/srv/lindfors-publisher/services"));
+        let queue = table
+            .get("queue")
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
-            .unwrap_or_else(|| queue.parent().map(|p| p.join("published")).unwrap_or_else(|| queue.join("published")));
+            .unwrap_or_else(|| queue_repo.join("queue"));
 
         Ok(Config {
             repo: PathBuf::from(s("repo", "/srv/lindfors-publisher/site")),
+            queue_repo,
             queue,
-            archive,
             weekday,
             hour: hour as u32,
             minute: minute as u32,
@@ -152,7 +159,7 @@ impl Entry {
         })
     }
 
-    fn slot_text(&self) -> String {
+    pub fn slot_text(&self) -> String {
         match self.week {
             Some((y, w)) => format!("{y}-W{w:02}"),
             None => "next free slot".to_string(),
@@ -310,7 +317,7 @@ fn published_in_week(posts: &[Post], week: (i32, u32)) -> Vec<&Post> {
         .collect()
 }
 
-fn read_queue(queue: &Path) -> Result<Vec<Entry>, String> {
+pub fn read_queue(queue: &Path) -> Result<Vec<Entry>, String> {
     if !queue.is_dir() {
         return Ok(Vec::new());
     }
@@ -357,12 +364,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "unqueue" => {
             let config = Config::load(Path::new(&config_path))?;
             let slug = args.get(1).ok_or("Usage: site-tools publish unqueue <slug>")?;
+            sync_queue(&config)?;
             let dir = config.queue.join(slug);
             if !dir.join("schedule.toml").is_file() {
                 return Err(format!("{slug} is not in the queue"));
             }
-            fs::remove_dir_all(&dir).map_err(|e| format!("Failed to remove {}: {e}", dir.display()))?;
-            println!("Removed {slug} from the queue.");
+            let hash = drop_entry(&config, slug, &format!("Unqueue: {slug}"))?;
+            println!("Removed {slug} from the queue ({hash}).");
             Ok(())
         }
         "-h" | "--help" | "help" | "" => {
@@ -391,6 +399,7 @@ fn print_usage() {
 }
 
 fn list(config: &Config) -> Result<(), String> {
+    sync_queue(config)?;
     let entries = read_queue(&config.queue)?;
     if entries.is_empty() {
         println!("Queue is empty ({}).", config.queue.display());
@@ -428,10 +437,9 @@ fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<()
     if !dry {
         // The clone is a robot's. Whatever it holds, the run starts from the branch it
         // is going to push to.
-        git(&config.repo, &["fetch", "--quiet", &config.remote, &config.branch])?;
-        git(&config.repo, &["reset", "--hard", "--quiet", &format!("{}/{}", config.remote, config.branch)])?;
-        git(&config.repo, &["clean", "-fdq"])?;
+        reset_to_remote(config, &config.repo)?;
     }
+    sync_queue(config)?;
 
     let posts = read_posts(&config.repo)?;
     let taken = published_in_week(&posts, current);
@@ -441,7 +449,16 @@ fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<()
         return Ok(());
     }
 
-    let entries = read_queue(&config.queue)?;
+    let mut entries = read_queue(&config.queue)?;
+    // Out already, whatever the queue says: a queue push that failed after the site
+    // push, or a post published by hand. Never twice.
+    entries.retain(|e| {
+        let out = posts.iter().any(|p| p.slug == e.slug && !p.draft && p.date.is_some());
+        if out {
+            println!("{}: already published on the site; remove it from the queue", e.slug);
+        }
+        !out
+    });
     let Some(entry) = pick(&entries, current) else {
         if entries.is_empty() {
             println!("{week_text}: queue is empty; nothing to do.");
@@ -510,13 +527,11 @@ fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<()
     println!("pushed {} as {}", entry.slug, hash.trim());
 
     // The entry is out of the queue from here: the post is on its way whatever happens
-    // to the mail, and the next run must not publish it twice.
-    fs::create_dir_all(&config.archive).map_err(|e| format!("Failed to create {}: {e}", config.archive.display()))?;
-    let archived = config.archive.join(&entry.slug);
-    if archived.exists() {
-        fs::remove_dir_all(&archived).map_err(|e| format!("Failed to clear {}: {e}", archived.display()))?;
-    }
-    fs::rename(&entry.dir, &archived).map_err(|e| format!("Failed to archive the queue entry: {e}"))?;
+    // to the mail. Should this push fail, the guard above keeps the next run from
+    // publishing it twice, and the entry is removed by hand.
+    let dropped = drop_entry(config, &entry.slug, &format!("Published: {}", entry.slug))
+        .map_err(|e| format!("published {} as {} but could not take it out of the queue: {e}; remove queue/{} by hand", entry.slug, hash.trim(), entry.slug))?;
+    println!("unqueued {} as {}", entry.slug, dropped);
 
     if !entry.send {
         println!("published {} {} commit={} newsletter=no", entry.slug, date, hash.trim());
@@ -592,6 +607,38 @@ fn http_status(url: &str) -> String {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|e| format!("curl failed: {e}"))
+}
+
+/// Fetch and hard-reset a robot clone to its remote branch. Nothing kept in it
+/// survives except what is ignored.
+fn reset_to_remote(config: &Config, repo: &Path) -> Result<(), String> {
+    git(repo, &["fetch", "--quiet", &config.remote, &config.branch])?;
+    git(repo, &["reset", "--hard", "--quiet", &format!("{}/{}", config.remote, config.branch)])?;
+    git(repo, &["clean", "-fdq"])?;
+    Ok(())
+}
+
+/// The queue as the workstation last pushed it.
+fn sync_queue(config: &Config) -> Result<(), String> {
+    if !config.queue_repo.join(".git").exists() {
+        return Err(format!("{} is not a git clone; see host/README.md", config.queue_repo.display()));
+    }
+    reset_to_remote(config, &config.queue_repo).map_err(|e| format!("queue: {e}"))
+}
+
+/// Remove an entry from the queue with a commit, pushed. Returns the short hash.
+fn drop_entry(config: &Config, slug: &str, message: &str) -> Result<String, String> {
+    let rel = config
+        .queue
+        .strip_prefix(&config.queue_repo)
+        .map_err(|_| format!("{} is not inside {}", config.queue.display(), config.queue_repo.display()))?
+        .join(slug);
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    git(&config.queue_repo, &["rm", "-r", "--quiet", "--", &rel])?;
+    git(&config.queue_repo, &["commit", "--quiet", "-m", message])?;
+    let hash = git(&config.queue_repo, &["rev-parse", "--short", "HEAD"])?;
+    git(&config.queue_repo, &["push", "--quiet", &config.remote, &format!("HEAD:{}", config.branch)])?;
+    Ok(hash.trim().to_string())
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
@@ -733,7 +780,10 @@ mod tests {
         assert_eq!(c.weekday, Weekday::Wed);
         assert_eq!(c.hour, 7);
         assert_eq!(c.max_per_week, 1);
-        assert_eq!(c.archive, PathBuf::from("/srv/lindfors-publisher/published"));
+        assert_eq!(c.queue_repo, PathBuf::from("/srv/lindfors-publisher/services"));
+        assert_eq!(c.queue, PathBuf::from("/srv/lindfors-publisher/services/queue"));
+        let d = Config::parse("queue_repo = \"/srv/q\"\n").unwrap();
+        assert_eq!(d.queue, PathBuf::from("/srv/q/queue"));
         assert_eq!(c.send_command, vec!["sudo".to_string(), "/opt/lindfors-newsletter/send-issue".to_string()]);
         assert!(Config::parse("weekday = \"someday\"").is_err());
         assert!(Config::parse("timezone = \"Mars/Olympus\"").is_err());
