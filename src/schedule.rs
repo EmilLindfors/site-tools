@@ -24,7 +24,11 @@ use crate::{codemask, frontmatter, markers, publish, util};
 pub fn queue_dir(root: &Path) -> PathBuf {
     match util::setting(root, "QUEUE_DIR") {
         Some(dir) => PathBuf::from(dir),
-        None => root.parent().map(|p| p.join("lindfors-services")).unwrap_or_else(|| root.join("..")).join("queue"),
+        None => root
+            .parent()
+            .map(|p| p.join("lindfors-services"))
+            .unwrap_or_else(|| root.join(".."))
+            .join("queue"),
     }
 }
 
@@ -51,10 +55,25 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
         slug => {
             let week = crate::parse_flag(&args[1..], "--week");
+            let at = crate::parse_flag(&args[1..], "--at");
+            if at.is_some() && week.is_some() {
+                return Err("--at and --week are mutually exclusive".into());
+            }
+            if let Some(at) = &at {
+                chrono::DateTime::parse_from_rfc3339(at).map_err(|e| format!("invalid --at: {e}"))?;
+            }
             let subject = crate::parse_flag(&args[1..], "--subject");
             let send = !args[1..].iter().any(|a| a == "--no-send");
             let twir = args[1..].iter().any(|a| a == "--twir");
-            add(&root, &queue, slug, week.as_deref(), subject.as_deref(), send, twir)
+            add(&root, &queue, slug, week.as_deref(), subject.as_deref(), send, twir)?;
+            if let Some(at) = at {
+                let path = queue.join(slug).join("schedule.toml");
+                let mut text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                text.push_str(&format!("publish_at = {}\n", toml_string(&at)));
+                fs::write(path, text).map_err(|e| e.to_string())?;
+                println!("  exact publication: {at}");
+            }
+            Ok(())
         }
     }
 }
@@ -63,9 +82,9 @@ fn print_usage() {
     eprintln!("site-tools schedule — Queue a post for publishing");
     eprintln!();
     eprintln!("Subcommands:");
-    eprintln!("  <slug> [--week YYYY-Www] [--no-send] [--subject ...] [--twir]");
+    eprintln!("  <slug> [--at RFC3339] [--week YYYY-Www] [--no-send] [--subject ...] [--twir]");
     eprintln!("                    Copy content/blog/<slug>/ and its audio into the queue");
-    eprintln!("                    --twir: submit it to This Week in Rust when it goes out");
+    eprintln!("                    --twir: submit it to This Week in Rust when it goes out (only a post that walks through Rust source)");
     eprintln!("  list              What is queued, and what is not yet committed");
     eprintln!("  remove <slug>     Take a post back out of the queue");
     eprintln!();
@@ -78,12 +97,16 @@ fn print_usage() {
 
 fn check_slug(slug: &str) -> Result<(), String> {
     let ok = !slug.is_empty()
-        && slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         && !slug.starts_with('-');
     if ok {
         Ok(())
     } else {
-        Err(format!("{slug:?} is not a slug: lowercase letters, digits and hyphens only"))
+        Err(format!(
+            "{slug:?} is not a slug: lowercase letters, digits and hyphens only"
+        ))
     }
 }
 
@@ -94,7 +117,15 @@ fn check_slug(slug: &str) -> Result<(), String> {
 /// workflow in `.github/workflows/` opens the pull request on that push. A `rust` tag
 /// does not make a post Rust content (the analytics post has one and is a JavaScript
 /// loader), so this is a flag per post, not a rule.
-pub fn sidecar(slug: &str, title: &str, queued_at: &str, week: Option<&str>, subject: Option<&str>, send: bool, twir: bool) -> String {
+pub fn sidecar(
+    slug: &str,
+    title: &str,
+    queued_at: &str,
+    week: Option<&str>,
+    subject: Option<&str>,
+    send: bool,
+    twir: bool,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!("slug = {}\n", toml_string(slug)));
     out.push_str(&format!("title = {}\n", toml_string(title)));
@@ -119,7 +150,9 @@ fn toml_string(s: &str) -> String {
 /// The queue directory must be inside a checkout: the commit is the queueing.
 /// Returns the checkout's root.
 fn check_queue(queue: &Path) -> Result<PathBuf, String> {
-    let repo = queue.parent().ok_or_else(|| format!("{} has no parent", queue.display()))?;
+    let repo = queue
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", queue.display()))?;
     if !repo.join(".git").exists() {
         return Err(format!(
             "{} is not inside a git checkout. Clone lindfors-services beside the site, or set QUEUE_DIR.",
@@ -135,7 +168,15 @@ fn shown(path: &Path) -> String {
     text.strip_prefix(r"\\?\").map(String::from).unwrap_or(text)
 }
 
-fn add(root: &Path, queue: &Path, slug: &str, week: Option<&str>, subject: Option<&str>, send: bool, twir: bool) -> Result<(), String> {
+fn add(
+    root: &Path,
+    queue: &Path,
+    slug: &str,
+    week: Option<&str>,
+    subject: Option<&str>,
+    send: bool,
+    twir: bool,
+) -> Result<(), String> {
     check_slug(slug)?;
     if let Some(week) = week {
         publish::parse_week(week)?;
@@ -198,7 +239,8 @@ fn add(root: &Path, queue: &Path, slug: &str, week: Option<&str>, subject: Optio
         let src = root.join(&rel);
         if src.is_file() {
             let dst = entry.join(&rel);
-            fs::create_dir_all(dst.parent().unwrap()).map_err(|e| format!("Failed to create {}: {e}", dst.display()))?;
+            fs::create_dir_all(dst.parent().unwrap())
+                .map_err(|e| format!("Failed to create {}: {e}", dst.display()))?;
             fs::copy(&src, &dst).map_err(|e| format!("Failed to copy {rel}: {e}"))?;
             extras.push(rel);
         }
@@ -254,8 +296,15 @@ fn list(queue: &Path) -> Result<(), String> {
             if e.send { "newsletter" } else { "no mail   " },
             if e.twir { "twir" } else { "    " },
             e.queued_at,
-            e.subject.as_ref().map(|s| format!("  subject: {s}")).unwrap_or_default(),
-            if pending.iter().any(|p| p == &e.slug) { "  NOT PUSHED" } else { "" }
+            e.subject
+                .as_ref()
+                .map(|s| format!("  subject: {s}"))
+                .unwrap_or_default(),
+            if pending.iter().any(|p| p == &e.slug) {
+                "  NOT PUSHED"
+            } else {
+                ""
+            }
         );
     }
     if !pending.is_empty() {
@@ -270,13 +319,18 @@ fn list(queue: &Path) -> Result<(), String> {
 
 /// Slugs under the queue with uncommitted changes, or not tracked at all.
 fn uncommitted(repo: &Path, queue: &Path) -> Vec<String> {
-    let rel = queue.strip_prefix(repo).map(|p| p.to_path_buf()).unwrap_or_else(|_| PathBuf::from("queue"));
+    let rel = queue
+        .strip_prefix(repo)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|_| PathBuf::from("queue"));
     let output = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=all", "--"])
         .arg(&rel)
         .current_dir(repo)
         .output();
-    let Ok(output) = output else { return Vec::new() };
+    let Ok(output) = output else {
+        return Vec::new();
+    };
     let prefix = format!("{}/", rel.to_string_lossy().replace('\\', "/"));
     let mut slugs: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -324,7 +378,15 @@ mod tests {
 
     #[test]
     fn sidecar_carries_the_slot_and_the_send_flag() {
-        let s = sidecar("a-post", "A \"quoted\" title", "2026-09-03T20:00:00Z", Some("2026-W41"), None, true, false);
+        let s = sidecar(
+            "a-post",
+            "A \"quoted\" title",
+            "2026-09-03T20:00:00Z",
+            Some("2026-W41"),
+            None,
+            true,
+            false,
+        );
         let table: toml::Table = s.parse().unwrap();
         assert_eq!(table["slug"].as_str(), Some("a-post"));
         assert_eq!(table["title"].as_str(), Some("A \"quoted\" title"));
@@ -336,7 +398,15 @@ mod tests {
 
     #[test]
     fn sidecar_without_a_week_means_next_free_slot() {
-        let s = sidecar("a-post", "T", "2026-09-03T20:00:00Z", None, Some("From the archive"), false, true);
+        let s = sidecar(
+            "a-post",
+            "T",
+            "2026-09-03T20:00:00Z",
+            None,
+            Some("From the archive"),
+            false,
+            true,
+        );
         let table: toml::Table = s.parse().unwrap();
         assert!(table.get("week").is_none());
         assert_eq!(table["send"].as_bool(), Some(false));
