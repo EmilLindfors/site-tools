@@ -10,7 +10,9 @@
 
 set -e
 
-cd "$(dirname "${BASH_SOURCE[0]}")"
+# The workspace root, two levels up: `target/` is shared, so the binary does not land
+# under the crate directory even though the build is started there.
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 TARGET="aarch64-unknown-linux-musl"
 BIN="target/$TARGET/release/site-tools"
@@ -21,7 +23,7 @@ if ! rustup target list --installed | grep -qx "$TARGET"; then
 fi
 
 echo "Building for $TARGET without the cite feature..."
-cargo build --release --target "$TARGET" --no-default-features
+cargo build -p site-tools --release --target "$TARGET" --no-default-features
 
 echo
 echo "Built: $BIN"
@@ -32,6 +34,6 @@ cat <<'EOF'
 
 Copy it over and install it (host/README.md has the whole first-time setup):
 
-  scp tools/site-tools/target/aarch64-unknown-linux-musl/release/site-tools hetzner:/tmp/
+  scp target/aarch64-unknown-linux-musl/release/site-tools hetzner:/tmp/
   ssh hetzner 'sudo install -m 755 /tmp/site-tools /opt/lindfors-publisher/site-tools'
 EOF

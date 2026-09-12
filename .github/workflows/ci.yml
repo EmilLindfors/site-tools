@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Test both crates
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+      # The publisher on mail.lindfors.no is site-tools without `cite`, the one feature
+      # that pulls in C. Built here so a dependency added to the wrong side of the
+      # feature line fails in CI and not on the box's next cross-compile. Cross-compiled
+      # rather than merely feature-checked, because rust-lld linking statically against
+      # rustup's musl rust-std is the property that actually has to hold.
+      - name: Cross-compile the publisher build
+        run: cargo build -p site-tools --release --target aarch64-unknown-linux-musl --no-default-features
+
+      - name: Confirm it is a static aarch64 binary
+        run: |
+          bin=target/aarch64-unknown-linux-musl/release/site-tools
+          file "$bin"
+          file "$bin" | grep -q 'ARM aarch64' || { echo "not aarch64"; exit 1; }
+          file "$bin" | grep -q 'statically linked' || { echo "not static"; exit 1; }

@@ -4,7 +4,11 @@
 # it, so no cross C toolchain is needed.
 #
 # That holds only for a build with `--no-default-features`, which leaves out `cite`
-# (crossref-client and bundled SQLite are C). Everything the publisher runs is pure
-# Rust; see tools/site-tools/build-host.sh.
+# (crossref-client's reqwest brings aws-lc-sys). Everything the publisher runs is pure
+# Rust; see crates/site-tools/build-host.sh.
+#
+# At the workspace root rather than in the crate: cargo reads config from the cwd
+# upward, so a build started from anywhere in this workspace finds it. img-optim is
+# never cross-compiled -- it runs where the images are.
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
