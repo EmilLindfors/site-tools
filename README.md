@@ -63,4 +63,5 @@ covers `cite.rs`.
 
 ## Licence
 
-MIT OR Apache-2.0.
+None set yet, which means the default applies: all rights reserved. If you want to
+reuse a piece of this, ask — <emil@lindfors.no>.
