@@ -1,0 +1,38 @@
+[package]
+name = "site-tools"
+version = "0.1.0"
+edition = "2021"
+
+# `cite` is on by default and is the only thing here that needs a C toolchain, now
+# through one dependency rather than two: crossref-client takes reqwest with default
+# features, so rustls brings aws-lc-sys. (Until 2026-09-12 rusqlite's bundled SQLite was
+# the other, for the Zotero fallback that this no longer has.) The publisher on
+# mail.lindfors.no (Alpine, aarch64, musl) is built with `--no-default-features`, which
+# leaves markdown, speech, pdf, og, newsletter gen and publish, all pure Rust, so it
+# cross-compiles the way the newsletter binary does: a rustup target and rust-lld, no
+# cross compiler. Citations are resolved on the workstation before a post is scheduled.
+[features]
+default = ["cite"]
+cite = ["dep:crossref-client", "dep:tokio"]
+
+[dependencies]
+toml = "0.8"
+
+# `publish`: ISO weeks, weekdays and the hour in a named time zone. Both pure Rust.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
+
+# The one citation source that needs the network. A `@key` that is a DOI, or that the
+# post's `[extra.bib]` maps to one, is resolved against crossref; a key with neither is
+# an error, and a work crossref does not carry is written as a `[[extra.references]]`
+# entry by hand instead. A post whose citations are already resolved touches nothing.
+crossref-client = { version = "0.2", optional = true }
+
+# crossref-client is async and this is a CLI. One current-thread runtime, built where
+# the fetching happens, is the whole of the async surface here.
+tokio = { version = "1", features = ["rt", "time", "macros"], optional = true }
+
+# `hero`: the OpenRouter reply is JSON with the image inline as a base64 data URL. Both
+# crates were already in the tree as dependencies of crossref-client.
+serde_json = "1"
+base64 = "0.22"
