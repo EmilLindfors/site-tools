@@ -11,3 +11,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/site-tools", "crates/img-optim"]
+
+# img-optim carried this in its own manifest, where a workspace ignores it with a
+# warning. It is cargo's release default anyway, so nothing changes by hoisting it --
+# it is here to say the encoder is meant to be built optimised, which is the whole
+# point of running it by hand rather than in a build.
+[profile.release]
+opt-level = 3

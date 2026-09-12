@@ -9,5 +9,3 @@ webp = "0.3"
 gif = "0.13"
 webp-animation = "0.9"
 
-[profile.release]
-opt-level = 3
