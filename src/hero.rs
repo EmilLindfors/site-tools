@@ -450,8 +450,24 @@ fn optimise(root: &Path, source: &Path, thumbnail: bool, quality: &str) -> Resul
 }
 
 /// The img-optim binary, built if it is not there yet.
+///
+/// `IMG_OPTIM_BIN` names a built binary outright and `IMG_OPTIM_DIR` the crate, for the
+/// same reason `scripts/lib.sh` resolves this crate rather than hardcoding it: the
+/// generators are moving out of the site repo, and nothing that calls one should have
+/// to know where it ended up.
 fn img_optim_bin(root: &Path) -> Result<PathBuf, String> {
-    let dir = root.join("tools/img-optim");
+    if let Some(bin) = crate::util::setting(root, "IMG_OPTIM_BIN") {
+        let bin = PathBuf::from(bin);
+        if !bin.is_file() {
+            return Err(format!("IMG_OPTIM_BIN={} is not a file", bin.display()));
+        }
+        return Ok(bin);
+    }
+
+    let dir = match crate::util::setting(root, "IMG_OPTIM_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => root.join("tools/img-optim"),
+    };
     let candidates = [
         dir.join("target/release/img-optim.exe"),
         dir.join("target/release/img-optim"),
