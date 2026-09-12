@@ -1,21 +1,23 @@
 //! Resolve the citation markers in a post and store what they resolved to.
 //!
 //! A post is written with `@key` and `[@key]` markers (see `markers`). This resolves
-//! each against crossref or a local Zotero library (see `sources`), rewrites the marker
+//! each against crossref (see `sources`), rewrites the marker
 //! into a linked citation, and appends the reference record to the post's own
 //! frontmatter as `[[extra.references]]`, which is what `templates/components.html`
 //! renders.
 //!
 //! Storing the record in the post is what makes the pipeline offline: after the first
 //! run there are no markers left to resolve, so a build touches neither the network nor
-//! a Zotero database, and the reference cannot drift from the post citing it.
+//! anything outside the repository, and the reference cannot drift from the post citing
+//! it. A work crossref does not carry is written as a `[[extra.references]]` entry by
+//! hand; `render` reads those back before resolving, so such a key never reaches here.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::bib::Reference;
 use crate::markers::Marker;
-use crate::sources::{Resolver, Source};
+use crate::sources::Resolver;
 
 pub fn run(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
@@ -26,10 +28,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
     match args[0].as_str() {
         "process" => {
             if args.len() < 2 {
-                return Err("Usage: site-tools cite process <post-path> [--source auto|crossref|zotero] [--output <path>]".to_string());
+                return Err("Usage: site-tools cite process <post-path> [--output <path>]".to_string());
             }
             let file = PathBuf::from(&args[1]);
-            let source = parse_source(&args[2..])?;
             let output = super::parse_flag(&args[2..], "--output").map(PathBuf::from);
 
             let content = std::fs::read_to_string(&file)
@@ -43,7 +44,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 return Ok(());
             }
 
-            let mut resolver = Resolver::new(source);
+            let mut resolver = Resolver::new();
             let (final_content, n_refs) = render(&content, &mut resolver, "post")?;
 
             if let Some(out_path) = output {
@@ -55,23 +56,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        "all" => process_all(parse_source(&args[1..])?),
-        "list" => {
-            let library = open_zotero()?;
-            let citekeys = library.citekeys()?;
-            println!("Available citekeys ({}):\n", citekeys.len());
-            for (citekey, title) in citekeys {
-                let title: String = title.chars().take(60).collect();
-                println!("  @{citekey:<44} {title}");
-            }
-            Ok(())
-        }
+        "all" => process_all(),
         "lookup" => {
             if args.len() < 2 {
                 return Err("Usage: site-tools cite lookup <citekey|doi>".to_string());
             }
             let key = args[1].trim_start_matches('@');
-            let mut resolver = Resolver::new(parse_source(&args[2..])?);
+            let mut resolver = Resolver::new();
             let reference = resolver.resolve(key, None)?;
 
             println!("Key:      {}", reference.key);
@@ -90,11 +81,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
         "format" => {
             if args.len() < 2 {
-                return Err("Usage: site-tools cite format <citekey|doi> [--style apa] [--source auto|crossref|zotero]".to_string());
+                return Err("Usage: site-tools cite format <citekey|doi> [--style apa]".to_string());
             }
             let key = args[1].trim_start_matches('@');
             let style = super::parse_flag(&args[2..], "--style").unwrap_or_else(|| "apa".to_string());
-            let mut resolver = Resolver::new(parse_source(&args[2..])?);
+            let mut resolver = Resolver::new();
             let reference = resolver.resolve(key, None)?;
             let doi = reference.doi.as_deref().ok_or_else(|| {
                 format!("@{key} has no DOI, and crossref can only format a work it registered")
@@ -108,17 +99,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
         other => Err(format!("Unknown cite subcommand: {other}")),
     }
-}
-
-fn open_zotero() -> Result<crate::zotero::Library, String> {
-    crate::zotero::Library::open(&crate::zotero::default_data_dir())
-        .map_err(|e| format!("{e}\nHint: set ZOTERO_DATA_DIR to your Zotero data directory"))
-}
-
-fn parse_source(args: &[String]) -> Result<Source, String> {
-    super::parse_flag(args, "--source")
-        .unwrap_or_else(|| "auto".to_string())
-        .parse()
 }
 
 /// Resolve every marker in one post. Returns (content, count of references stored).
@@ -269,7 +249,7 @@ fn set_references(content: &str, refs: &[Reference]) -> Result<String, String> {
 }
 
 /// Resolve citations in every post under `content/blog/`, in place.
-pub fn process_all(source: Source) -> Result<(), String> {
+pub fn process_all() -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {e}"))?;
     let root = crate::util::find_project_root(&cwd)?;
     let blog = root.join("content/blog");
@@ -283,8 +263,7 @@ pub fn process_all(source: Source) -> Result<(), String> {
     posts.sort();
 
     // Read, mask and scan before opening anything: a run over posts whose citations are
-    // already resolved needs no network and no Zotero library at all, which after the
-    // first run is every run.
+    // already resolved needs no network at all, which after the first run is every run.
     let mut pending: Vec<(PathBuf, String)> = Vec::new();
     for post in posts {
         let content = std::fs::read_to_string(&post)
@@ -308,7 +287,7 @@ pub fn process_all(source: Source) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut resolver = Resolver::new(source);
+    let mut resolver = Resolver::new();
 
     for (post, content) in pending {
         let slug = crate::frontmatter::slug_from_path(&post);
@@ -337,28 +316,26 @@ fn print_usage() {
     eprintln!("  [@Christiansen2017]          parenthetical; join several with `;`");
     eprintln!("  [@10.1016/j.marpol...]       a DOI, which must be bracketed");
     eprintln!();
-    eprintln!("A key that is not a DOI is looked up in the post's [extra.bib] map, and");
-    eprintln!("failing that in a local Zotero library. Resolved references are written to");
-    eprintln!("the post's frontmatter as [[extra.references]], so later builds need neither.");
+    eprintln!("A key that is not a DOI is looked up in the post's [extra.bib] map. A work");
+    eprintln!("crossref does not carry -- a thesis, a standard, a book with no DOI -- is");
+    eprintln!("written as a [[extra.references]] entry by hand and is used as written.");
+    eprintln!("Resolved references are stored in the post, so later builds need no network.");
     eprintln!();
     eprintln!("Subcommands:");
-    eprintln!("  process <post-path> [--source ...] [--output <path>]");
+    eprintln!("  process <post-path> [--output <path>]");
     eprintln!("                              Resolve one post");
-    eprintln!("  all [--source ...]          Same, in place, for every post under content/blog/");
-    eprintln!("  list                        List all available citekeys from Zotero");
+    eprintln!("  all                         Same, in place, for every post under content/blog/");
     eprintln!("  lookup <citekey|doi>        Show what a marker resolves to");
     eprintln!("  format <citekey|doi> [--style apa]");
     eprintln!("                              The reference as crossref renders it in a CSL");
     eprintln!("                              style (apa, ieee, vancouver, ...); needs a DOI");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --source auto|crossref|zotero   auto routes on the marker's shape (default)");
     eprintln!("  --style <csl-style>             for `format`; https://api.crossref.org/styles lists them");
     eprintln!();
     eprintln!("Environment:");
     eprintln!("  CROSSREF_POLITE  an email address, which moves crossref requests into its");
     eprintln!("                   polite pool (3 req/s rather than 1)");
-    eprintln!("  ZOTERO_DATA_DIR  the Zotero data directory, for citekeys that are not DOIs");
 }
 
 /// True if the post opts out of citation processing via `extra.skip_citations`.

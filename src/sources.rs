@@ -1,10 +1,11 @@
-//! Where a citation's metadata comes from: crossref, or a local Zotero library.
+//! Where a citation's metadata comes from: crossref, or the post itself.
 //!
-//! Nothing here is configured. The marker decides: a `@key` that is a DOI, or that the
-//! post's `[extra.bib]` maps to one, goes to crossref; anything left goes to Zotero.
-//! A site that only ever writes DOIs never opens a Zotero database, and someone who
-//! prefers their Zotero collection carries on writing citekeys and never reaches the
-//! network. `--source` forces one when the default routing is not what is wanted.
+//! Nothing here is configured. A `@key` that is a DOI, or that the post's `[extra.bib]`
+//! maps to one, is looked up against crossref; a key with neither is an error naming
+//! the two ways to give it metadata. The third way needs nothing here at all: a
+//! `[[extra.references]]` entry written by hand is read back by `cite` before this is
+//! reached, which is what covers a work crossref has never heard of -- a thesis in an
+//! institutional repository, a standard, a book with no DOI.
 
 use std::collections::BTreeMap;
 
@@ -12,47 +13,22 @@ use crossref_client::{CnFormat, Contributor, Crossref, Work};
 
 use crate::bib::Reference;
 
-/// Which source a run is allowed to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    /// Route on the marker: a DOI to crossref, a bare key to Zotero.
-    Auto,
-    /// Crossref only. A key with no `[extra.bib]` entry is an error rather than a
-    /// silent Zotero lookup.
-    Crossref,
-    /// Zotero only, which is what this tool did before crossref was an option.
-    Zotero,
-}
-
-impl std::str::FromStr for Source {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "auto" => Ok(Source::Auto),
-            "crossref" => Ok(Source::Crossref),
-            "zotero" => Ok(Source::Zotero),
-            other => Err(format!(
-                "Unknown citation source: {other} (want auto, crossref or zotero)"
-            )),
-        }
-    }
-}
-
-/// Resolves citation markers, opening each backing source only when one is needed.
+/// Resolves citation markers, building the crossref client only when one needs it.
 pub struct Resolver {
-    source: Source,
     crossref: Option<Crossref>,
-    zotero: Option<crate::zotero::Library>,
     cache: BTreeMap<String, Reference>,
 }
 
+impl Default for Resolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Resolver {
-    pub fn new(source: Source) -> Self {
+    pub fn new() -> Self {
         Self {
-            source,
             crossref: None,
-            zotero: None,
             cache: BTreeMap::new(),
         }
     }
@@ -77,16 +53,14 @@ impl Resolver {
             return Ok(hit.clone());
         }
 
-        let reference = match (self.source, doi) {
-            (Source::Zotero, _) => self.from_zotero(key, &anchor)?,
-            (_, Some(doi)) => self.from_crossref(&doi, &anchor)?,
-            (Source::Crossref, None) => {
-                return Err(format!(
-                    "@{key} is not a DOI and the post's [extra.bib] does not map it to one"
-                ));
-            }
-            (Source::Auto, None) => self.from_zotero(key, &anchor)?,
+        let Some(doi) = doi else {
+            return Err(format!(
+                "@{key} is not a DOI and the post's [extra.bib] does not map it to one. \
+                 Add it there, or write the [[extra.references]] entry by hand for a work \
+                 crossref does not carry"
+            ));
         };
+        let reference = self.from_crossref(&doi, &anchor)?;
 
         self.cache.insert(anchor, reference.clone());
         Ok(reference)
@@ -108,19 +82,6 @@ impl Resolver {
         Ok(from_work(&work, anchor))
     }
 
-    fn from_zotero(&mut self, key: &str, anchor: &str) -> Result<Reference, String> {
-        if self.zotero.is_none() {
-            let dir = crate::zotero::default_data_dir();
-            self.zotero = Some(crate::zotero::Library::open(&dir).map_err(|e| {
-                format!(
-                    "{e}
-                     Hint: set ZOTERO_DATA_DIR, or give @{key} a DOI in the post's                      [extra.bib] so it resolves against crossref instead"
-                )
-            })?);
-        }
-
-        Ok(self.zotero.as_ref().unwrap().lookup(key)?.to_reference(anchor))
-    }
 }
 
 /// A crossref client, polite when an address has been provided for the purpose.
@@ -132,7 +93,7 @@ impl Resolver {
 /// A reference rendered by crossref in a named CSL style (`apa`, `ieee`,
 /// `vancouver`, ...). Crossref formats it server-side from the deposited
 /// metadata, so this needs a DOI and the network, and answers an unknown style
-/// with a 406. Content negotiation cannot cover a Zotero-only reference.
+/// with a 406. Content negotiation cannot cover a reference written by hand.
 pub fn format_bibliography(doi: &str, style: &str) -> Result<String, String> {
     let client = build_client()?;
     let rendered = runtime()?
@@ -262,10 +223,8 @@ pub fn apa_authors(authors: &[Contributor]) -> String {
     apa_authors_from_parts(&parts)
 }
 
-/// The same, from (given, family) pairs -- which is the shape Zotero stores.
-///
-/// Both sources go through here so a reference reads the same however it was resolved.
-pub fn apa_authors_from_parts(authors: &[(String, String)]) -> String {
+/// The same, from (given, family) pairs already split by the caller.
+fn apa_authors_from_parts(authors: &[(String, String)]) -> String {
     let names: Vec<String> = authors
         .iter()
         .map(|(given, family)| {
@@ -326,14 +285,6 @@ mod tests {
             affiliation: Vec::new(),
             sequence: "first".into(),
         }
-    }
-
-    #[test]
-    fn source_parses_the_three_names() {
-        assert_eq!("auto".parse::<Source>().unwrap(), Source::Auto);
-        assert_eq!("crossref".parse::<Source>().unwrap(), Source::Crossref);
-        assert_eq!("zotero".parse::<Source>().unwrap(), Source::Zotero);
-        assert!("bibtex".parse::<Source>().is_err());
     }
 
     #[test]

@@ -24,8 +24,6 @@ mod schedule;
 mod sources;
 mod speech;
 mod util;
-#[cfg(feature = "cite")]
-mod zotero;
 
 use std::{env, process};
 
@@ -273,10 +271,9 @@ fn print_usage() {
     eprintln!("Commands:");
     eprintln!("  audio gen <slug> [--force]              Synthesise the MP3 for one post");
     eprintln!("  audio all [--force] [--dry-run]         Same, for every post with a script");
-    eprintln!("  cite process <post-path> [--style ...]  Replace @citekeys with formatted citations");
-    eprintln!("  cite all [--style ...]                  Same, in place, for every post");
-    eprintln!("  cite list                               List available Zotero citekeys");
-    eprintln!("  cite lookup <citekey>                   Show reference details");
+    eprintln!("  cite process <post-path> [--output ...] Replace @citekeys with formatted citations");
+    eprintln!("  cite all                                Same, in place, for every post");
+    eprintln!("  cite lookup <citekey|doi>               Show reference details");
     eprintln!("  cv build                                Compile cv.typ to static/cv.pdf");
     eprintln!("  markdown gen <post-path>                Generate plain markdown for one post");
     eprintln!("  markdown all                            Same, for every post (skips drafts)");
@@ -293,7 +290,6 @@ fn print_usage() {
     eprintln!("Examples:");
     eprintln!("  site-tools cite all");
     eprintln!("  site-tools cite process content/blog/my-post/index.md");
-    eprintln!("  site-tools cite list");
     eprintln!("  site-tools cite lookup @Smith2020");
     eprintln!("  site-tools newsletter gen content/blog/my-post/index.md");
     eprintln!("  site-tools newsletter send my-post");

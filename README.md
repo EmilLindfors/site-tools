@@ -14,14 +14,28 @@ The binary is at `target/release/site-tools`. Run all commands from the project 
 
 ### cite
 
-Process Zotero citations (`@citekey` references) in blog posts. Requires [Zotero](https://www.zotero.org/) with [Better BibTeX](https://retorque.re/zotero-better-bibtex/) installed.
+Resolve the `@citekey` markers in blog posts against crossref, and store what they
+resolved to in the post's own frontmatter.
 
-The tool auto-detects Zotero's data directory. Override with `ZOTERO_DATA_DIR` env var if needed.
+A marker resolves one of three ways, in this order:
+
+1. A `[[extra.references]]` entry the post already carries, whether written by an
+   earlier run or **by hand**. This needs no network, and is how a work crossref does
+   not carry — a thesis in an institutional repository, a standard, a book with no DOI
+   — gets cited. Write the entry with `key` (the anchor, matching what follows the
+   `@`), `type`, `author`, `title`, `year`, plus any of `journal`, `volume`, `number`,
+   `pages`, `publisher`, `booktitle`, `school`, `isbn`, `doi`, `url`. The in-text
+   surname is derived from `author`; any field not in that list is dropped on the next
+   run.
+2. A DOI: either the marker itself (bracketed, `[@10.xxxx/...]`) or the post's
+   `[extra.bib]` map, resolved against crossref.
+3. Nothing — which is an error naming the two options above, with the marker left in
+   the text so it shows up in the rendered post.
+
+The Zotero/Better BibTeX fallback was removed on 2026-09-12: it only ever worked on the
+workstation, and it was the reason this crate needed a C toolchain for `rusqlite`.
 
 ```sh
-# List all available citekeys from Zotero/BBT
-site-tools cite list
-
 # Look up a specific citekey
 site-tools cite lookup @Christiansen2017
 
@@ -112,7 +126,7 @@ debugging what Typst was actually fed.
 
 ## Dependencies
 
-- **cite**: Zotero + Better BibTeX (reads their SQLite databases directly)
+- **cite**: the network, for crossref (`CROSSREF_POLITE` moves it into the polite pool)
 - **newsletter send**: `curl`, `.env` file with `ADMIN_KEY`
 - **pdf gen / cv build**: `typst` CLI, and fonts in `fonts/` (`./scripts/fetch-fonts.sh`)
 
@@ -121,6 +135,6 @@ debugging what Typst was actually fed.
 `build.sh` and `deploy.sh` call this binary and build it first if it is missing;
 they no longer do any of the work themselves. The scripts this replaced —
 `generate-pdf.sh`, `generate-newsletter.sh`, `send-newsletter.sh` — are gone, as is
-the external `zotero-cite` binary (it is a library dependency now). What remains in
+the external `zotero-cite` binary. What remains in
 `scripts/` is `fetch-fonts.sh` and the `lib.sh` helpers for locating zola and this
 binary.
