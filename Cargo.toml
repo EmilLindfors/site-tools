@@ -1,0 +1,13 @@
+# The generators behind lindfors.no, in their own repository.
+#
+# They used to live in the site repo under `tools/`, which conflated two jobs: the site
+# is what Cloudflare builds from `content/`, `templates/` and `static/`, and these are
+# what produce the committed files it then serves. Cloudflare never runs anything here.
+#
+# A workspace rather than two repositories because they are used together -- `site-tools
+# hero` shells out to `img-optim` -- and released together. They deliberately do NOT
+# share a dependency set: site-tools' `cite` feature is HTTP and img-optim is C (libwebp),
+# so the one thing they have in common is the machine they run on.
+[workspace]
+resolver = "2"
+members = ["crates/site-tools", "crates/img-optim"]
