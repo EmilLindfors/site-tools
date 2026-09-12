@@ -1,0 +1,13 @@
+[package]
+name = "img-optim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "tiff"] }
+webp = "0.3"
+gif = "0.13"
+webp-animation = "0.9"
+
+[profile.release]
+opt-level = 3
