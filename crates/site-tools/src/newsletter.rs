@@ -8,9 +8,13 @@ use crate::frontmatter;
 const SITE_URL: &str = "https://lindfors.no";
 
 /// Where the newsletter service lives: the send is an operator action, so it is
-/// reached through the admin name, behind ADMIN_KEY, and never through the public
+/// reached through the tailnet name, behind ADMIN_KEY, and never through the public
 /// newsletter.lindfors.no vhost, which routes only subscribe, confirm and unsubscribe.
-const ADMIN_URL: &str = "https://admin.lindfors.no";
+///
+/// The dashboard sits under /newsletter/ on services.lindfors.no and nginx strips that
+/// prefix, so the service sees the path below at its own root. admin.lindfors.no was
+/// the name until 2026-09-07 and its vhost is gone.
+const ADMIN_URL: &str = "https://services.lindfors.no/newsletter";
 
 /// Clean markdown body for email: strip shortcodes, math blocks, etc.
 fn clean_body(body: &str) -> String {
