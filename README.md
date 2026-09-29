@@ -22,7 +22,7 @@ that, on a workstation or on the publishing host, and what they write is committ
 | `og` | The 1200×630 share image |
 | `hero` | Model-drawn hero images and social cards, through OpenRouter |
 | `newsletter` | The issue file for a post |
-| `schedule` / `publish` | Queueing a finished post, and publishing it on the day |
+| `publish` | On the box: publishing the writing desk's confirmed revision at its time |
 
 **`crates/img-optim`** — converts an image to WebP at the sizes the site uses. Run by
 hand when an image is added; `site-tools hero` also shells out to it.
@@ -39,7 +39,7 @@ needs the network, and currently the only thing in that crate that needs a C too
 (crossref-client takes reqwest with default features, so rustls brings `aws-lc-sys`).
 The publisher builds `--no-default-features`, which is pure Rust and cross-compiles to
 `aarch64-unknown-linux-musl` with nothing but a rustup target and `rust-lld`; citations
-are resolved before a post is ever queued. `img-optim` is C either way — libwebp.
+are resolved before a post is ever confirmed. `img-optim` is C either way — libwebp.
 
 ## Using them from the site
 

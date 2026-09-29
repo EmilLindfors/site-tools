@@ -19,7 +19,6 @@ mod newsletter;
 mod og;
 mod pdf;
 mod publish;
-mod schedule;
 #[cfg(feature = "cite")]
 mod sources;
 mod speech;
@@ -48,7 +47,6 @@ fn main() {
         "og" => run_og(&args[2..]),
         "pdf" => run_pdf(&args[2..]),
         "publish" => publish::run(&args[2..]),
-        "schedule" => schedule::run(&args[2..]),
         "speech" => run_speech(&args[2..]),
         "-h" | "--help" | "help" => {
             print_usage();
@@ -280,9 +278,7 @@ fn print_usage() {
     eprintln!("  newsletter gen <post-path>              Generate newsletter .md from blog post");
     eprintln!("  newsletter send <slug> [--subject ...]  Send newsletter to subscribers");
     eprintln!("  pdf gen <post-path>                     Generate PDF from blog post");
-    eprintln!("  publish run|next|list|unqueue           On the box: publish the next queued post (publish help)");
-    eprintln!("  schedule <slug> [--week YYYY-Www]       Queue a draft on the box for its week (schedule help)");
-    eprintln!("  schedule list | remove <slug>           See the queue, or take a post back out");
+    eprintln!("  publish run|next|list                   On the box: publish the earliest confirmed revision (publish help)");
     eprintln!("  pdf all                                 Generate PDFs for all posts (skips drafts)");
     eprintln!("  speech gen <post-path>                  Write the spoken script for one post");
     eprintln!("  speech all                              Same, for every post (skips drafts)");

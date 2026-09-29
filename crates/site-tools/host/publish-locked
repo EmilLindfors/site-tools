@@ -1,0 +1,10 @@
+#!/bin/sh
+# The publisher's cron command, from root's crontab once a minute: the desk's
+# read-only database credential from its bundle, the publisher account, and one run
+# at a time. A run that finds the lock held exits at once; a run can wait twenty
+# minutes for the site to come up, and the next minute's tick must not start a second.
+#
+#   * * * * * /opt/lindfors-publisher/publish-locked >> /var/log/lindfors-publisher/publish.log 2>&1
+exec sec exec host/publisher -- su-exec publisher \
+    flock -n /srv/lindfors-publisher/publish.lock \
+    /opt/lindfors-publisher/site-tools publish run "$@"

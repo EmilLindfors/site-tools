@@ -1,14 +1,20 @@
 # The publisher on mail.lindfors.no
 
-Posts written ahead do not sit in this repo, which is public. They sit in `queue/` of
-the private lindfors-services repo, which the box holds as a clone, and `site-tools
-publish`, run there every hour from cron as the `publisher` account, moves the next one
-into a clone of the site on its week's slot: dates it, drops `draft`, makes the derived
-files, commits, pushes, removes the entry from the queue with a commit of its own, waits
-for the page, and hands the slug to the newsletter binary over loopback. The workstation
-end is `site-tools schedule`, which writes into the lindfors-services checkout beside
-this one; the push is the queueing. The rules are in `src/publish.rs`; this file is
-the install.
+A post is written, reviewed and confirmed in the writing desk (`lindfors-services`,
+`crates/lindfors-writing`, with the admin at `services.lindfors.no/admin/`). Its
+confirmed approval names a revision, its content digest and the instant it goes out.
+`site-tools publish`, run on the box every minute from cron as the `publisher`
+account, reads those approvals from the desk's database with a read-only role, takes
+the earliest due one on under the article's own lock, exports the revision and its
+assets as a page bundle, dates it, drops `draft`, makes the derived files, commits,
+pushes, waits for the page, and hands the slug to the newsletter binary over
+loopback. Each step goes into a receipt the desk reads back. The rules are in
+`src/publish.rs`; this file is the install.
+
+Until 2026-09-29 the queue was a directory in the private lindfors-services repo,
+filled by `site-tools schedule` on the workstation and by a socket gateway the desk
+called. That is gone: a finished post from outside the desk is imported through the
+admin's Import, and the second deploy key and clone are no longer needed.
 
 ## What is where on the host
 
@@ -16,10 +22,11 @@ the install.
 |---|---|---|
 | The binary, built without `cite` | `/opt/lindfors-publisher/site-tools` | root, 0755 |
 | Config: cadence, paths, the send command | `/etc/lindfors-publisher.toml` | root, 0644 |
-| A clone of lindfors-services, pushable; `queue/` in it is the queue | `/srv/lindfors-publisher/services/` | publisher |
 | A clone of the site, pushable | `/srv/lindfors-publisher/site/` | publisher |
 | Deploy key, write access, the site repo | `/srv/lindfors-publisher/.ssh/id_ed25519` | publisher, 0600 |
-| Deploy key, write access, lindfors-services | `/srv/lindfors-publisher/.ssh/id_services` | publisher, 0600 |
+| The desk's read-only database credential | the `host/publisher` sec bundle, `PUBLISHER_DATABASE_URL` | root decrypts |
+| Receipts, one per publication | `/srv/lindfors-publisher/receipts/` | publisher, group writing-queue, 0750 |
+| The cron command: bundle, account, lock, run | `/opt/lindfors-publisher/publish-locked` | root, 0755 |
 | Fonts for the PDFs | `/srv/lindfors-publisher/site/fonts/` | publisher (gitignored) |
 | The one root command it may run | `/opt/lindfors-newsletter/send-issue` | root, 0755 |
 | Log | `/var/log/lindfors-publisher/publish.log` | publisher |
@@ -83,48 +90,29 @@ EOS
 `fetch-fonts.sh` has no exec bit in git, hence `bash`. Done on 2026-09-03; the deploy
 key was added from the workstation with `gh repo deploy-key add <pubkey> --allow-write`.
 
-The queue is a second clone with a second key, so a key that leaks opens one repo and
-not both. The `Host` alias in `.ssh/config` is what `git` picks the key by; the clone
-uses that alias as its remote host.
+The desk's database role comes from `crates/lindfors-writing/host/provision-db.sh`
+in lindfors-services, which creates `writing_publisher` with `SELECT` on the desk's
+tables and imports the `host/publisher` bundle. The publisher must be in the
+`writing-queue` group to read the desk's assets, and the receipts directory is its own:
 
 ```sh
-su -s /bin/sh publisher <<'EOS'
-cd ~
-ssh-keygen -t ed25519 -N '' -C 'lindfors-publisher-services@mail.lindfors.no' -f .ssh/id_services
-printf 'Host github-services\n  HostName github.com\n  IdentityFile ~/.ssh/id_services\n  IdentitiesOnly yes\n' >> .ssh/config
-chmod 0600 .ssh/config
-cat .ssh/id_services.pub
-EOS
+adduser publisher writing-queue
+install -d -o publisher -g writing-queue -m 0750 /srv/lindfors-publisher/receipts
+install -d -o publisher -g publisher -m 0750 /srv/lindfors-publisher/export
+install -m 755 /tmp/publish-locked /opt/lindfors-publisher/publish-locked
 ```
 
-From the workstation, in the lindfors-services checkout:
-`gh repo deploy-key add <pubkey file> --allow-write --title mail.lindfors.no-publisher`.
-Then, as `publisher`:
-
 ```sh
-su -s /bin/sh publisher <<'EOS'
-cd ~
-git clone git@github-services:EmilLindfors/lindfors-services.git services
-git -C services config user.name  "lindfors-publisher"
-git -C services config user.email "publisher@lindfors.no"
-/opt/lindfors-publisher/site-tools publish list
-EOS
-```
-
-The last line proves both clones read and shows the queue as pushed. Done on
-2026-09-07, when the queue moved off `/srv/lindfors-publisher/queue` (removed) into
-the repo.
-
-```sh
-# 6. Cron: every hour, as publisher. busybox crond reads /etc/crontabs/<user>.
-echo '7 * * * * /opt/lindfors-publisher/site-tools publish run >> /var/log/lindfors-publisher/publish.log 2>&1' \
-  > /etc/crontabs/publisher
-chmod 0600 /etc/crontabs/publisher && chown root:root /etc/crontabs/publisher
+# 6. Cron: once a minute, from root's crontab, because root decrypts the bundle;
+#    publish-locked drops to publisher and holds the lock. Remove the old hourly
+#    line from /etc/crontabs/publisher.
+echo '* * * * * /opt/lindfors-publisher/publish-locked >> /var/log/lindfors-publisher/publish.log 2>&1' \
+  >> /etc/crontabs/root
 rc-service crond restart
 ```
 
-Emil's own account queues posts through `sudo -u publisher`, which `NOPASSWD: ALL`
-already allows; nothing else on the host changes.
+`site-tools publish list` as publisher, under `sec exec host/publisher`, shows every
+confirmed approval with its time and receipt, and what the next run would do.
 
 ## Build and copy, from the workstation
 
@@ -132,6 +120,7 @@ already allows; nothing else on the host changes.
 ./tools/site-tools/build-host.sh
 scp tools/site-tools/target/aarch64-unknown-linux-musl/release/site-tools \
     tools/site-tools/host/lindfors-publisher.toml \
+    tools/site-tools/host/publish-locked \
     ../lindfors-services/crates/lindfors-newsletter/send-issue hetzner:/tmp/
 ```
 
@@ -144,47 +133,37 @@ newsletter` there, copy, `rc-service lindfors-newsletter restart`.
 
 ## Day to day
 
-```sh
-site-tools schedule <slug>                    # next free week; --week 2026-W41 pins one
-site-tools schedule <slug> --no-send          # publish without an issue
-site-tools schedule <slug> --twir             # and submit it to This Week in Rust
-site-tools schedule list                      # the queue, marking what is not pushed yet
-site-tools schedule remove <slug>
-```
+Nothing is run here by hand. A post is written or imported, reviewed, validated and
+confirmed for a time in the writing desk; the next minute's run after that time
+publishes it. On the box, under `sec exec host/publisher -- su-exec publisher`, the
+same binary answers `publish list` (every confirmed approval with its time and
+receipt, then what the next run would do) and `publish next` (a dry run).
 
-Each of those changes `../lindfors-services/queue/` (or `QUEUE_DIR`) and prints the
-`git` line that makes it count: the box sees the queue as last pushed, nothing else.
+`twir` on the approval costs the box nothing: the publish commit gets a
+`Syndicate: this-week-in-rust` trailer and the repo's `twir` workflow opens the pull
+request on the push, with the `TWIR_TOKEN` secret on GitHub. Nothing here holds a
+GitHub API token.
 
-`--twir` costs the box nothing: the publish commit gets a `Syndicate: this-week-in-rust`
-trailer and the repo's `twir` workflow opens the pull request on the push, with the
-`TWIR_TOKEN` secret on GitHub. Nothing here holds a GitHub API token.
-
-On the box, the same binary answers `publish next` (a dry run), `publish run --now`
-(ignore the hour), `publish run --force` (ignore the one-per-week rule), and
-`publish unqueue <slug>`.
-
-A post is queued when it is finished: linted, cited (`site-tools cite all`; `schedule`
-refuses a post with a marker left), hero and card made, `draft = true` still set. The
-publisher removes the flag, sets `date` to the day it runs, and after the push removes
-the entry from the queue with a commit (`Published: <slug>`) pushed to
-lindfors-services. `git pull` in both checkouts afterwards: the site gets the published
-copy at the same path as the local draft, the services repo loses the entry.
+A post is confirmed when it is finished: linted, cited (the desk's validation refuses a
+marker left over), hero and card made, `draft = true` still set. The publisher removes
+the flag, sets `date` to the day it runs, and pushes. `git pull` in the site checkout
+afterwards.
 
 ## What can go wrong
 
+- **The approval does not add up** (digest, validation, a missing asset): the run
+  prints why and skips it; nothing is written. Fix it in the desk: a new revision, a new
+  validation, a new proposal.
+- **Withdrawn under the publisher**: the desk refuses a withdrawal once the receipt
+  exists, and the publisher refuses an approval that changed between the read and the
+  lock. Neither side can win the race the other lost.
 - **The push fails** (someone pushed at the same moment, the key is gone): the run
-  exits non-zero, the entry stays queued, nothing is mailed, and the next hour's run
-  resets the clones and tries again.
-- **The site push succeeds and the queue push fails**: the run exits non-zero naming
-  the entry, and nothing is mailed. The next run sees the slug as a dated post in the
-  site clone and refuses to publish it again, printing that it should be removed from
-  the queue: `site-tools schedule remove <slug>` on the workstation, commit, push. The
-  issue then goes by hand, as below.
-- **The page never answers 200** within `wait_minutes`: the post is published and
-  archived, the mail is not sent, and the log says to send by hand:
+  exits non-zero, the receipt is dropped, nothing is mailed, and the next minute's run
+  resets the clone and tries again from the desk's approval.
+- **The page never answers 200** within `wait_minutes`: the post is pushed, the
+  receipt says `deploying`, the mail is not sent, and the next run waits again. A
+  page that never comes up is sent by hand once it does:
   `sudo /opt/lindfors-newsletter/send-issue <slug>`. The `sends` table stops a double.
 - **The send is partial**: the newsletter's own log names the addresses; `send-issue
   <slug> --catch-up` retries the ones without a delivery.
-- **A week gets two posts**: it cannot from here. The run counts every post dated in
-  the current ISO week, published by hand or not, against `max_per_week`.
 - **A series would share a date**: refused before anything is written.

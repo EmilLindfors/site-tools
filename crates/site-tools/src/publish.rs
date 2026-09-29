@@ -1,56 +1,64 @@
-//! Publish the next queued post. Runs on mail.lindfors.no as the `publisher` account,
-//! from cron, against a clone of the site repo it can push to with a deploy key.
+//! Publish the next confirmed revision. Runs on mail.lindfors.no as the `publisher`
+//! account, from cron, against a clone of the site repo it can push to with a deploy
+//! key.
 //!
-//! The queue is `queue/` in the private lindfors-services repo, which the box holds as
-//! a second clone with its own deploy key: one directory per post, holding `post/`
-//! (the page bundle), `static/` (audio and speech files, if any) and a `schedule.toml`
-//! sidecar, put there by `schedule.rs` on the workstation and pushed. A run is one
-//! decision and one sequence:
+//! What to publish is in the writing desk's database: an article whose approval is
+//! confirmed names the revision, its content digest and the instant it goes out. The
+//! publisher reads that with a read-only role, and until 2026-09-29 it read a `queue/`
+//! directory in the private lindfors-services repo instead, filled by a Unix-socket
+//! gateway the desk called; the database is the one place the decision was ever made,
+//! so the queue, the gateway and the second deploy key are gone. A run:
 //!
-//! - *Is it time?* The config names a weekday, an hour and a time zone. The slot for the
-//!   current ISO week is that moment; before it, nothing happens. After it, the run
-//!   proceeds if fewer than `max_per_week` posts in the repo carry a date in this week,
-//!   which is what makes a run every hour idempotent and a missed hour catch up on its
-//!   own, and what stops a second post going out in a week someone published by hand.
-//! - *Which post?* An entry pinned to this week or an earlier one, oldest pin first;
-//!   otherwise the earliest queued entry with no pin. Entries pinned to a later week wait.
-//! - *The sequence.* Reset both clones to their remote branches, move the bundle in,
-//!   write today's date into its frontmatter and drop `draft`, generate the derived
-//!   files the build would, commit, push. Take the entry out of the queue with a commit
-//!   pushed to the queue's repo. Then, if the sidecar says so, wait for the page to
-//!   answer 200 and hand the slug to the newsletter binary over loopback. Every step
-//!   fails closed: a failed push mails nobody, and the next run starts from the remotes
-//!   again. A slug the site already carries as a dated post is never published twice,
-//!   whatever the queue says, which covers a queue push that failed after a site push.
+//! - *Is anything due?* The earliest confirmed approval whose `publish_at` has passed,
+//!   validated for that exact revision and not yet taken on. Nothing else counts:
+//!   there is no weekly slot and no cap, because a time is chosen for every post.
+//! - *Take it on.* Under the article's own advisory lock (the one the desk holds while
+//!   it applies a command), read the article once more, check the approval still
+//!   stands, and write the receipt. From that receipt on the desk refuses to withdraw.
+//! - *The sequence.* Export the revision and its assets into a bundle, reset the site
+//!   clone to its remote branch, move the bundle in, write today's date into its
+//!   frontmatter and drop `draft`, generate the derived files the build would, commit,
+//!   push. Then wait for the page to answer 200 and, if the approval says so, hand the
+//!   slug to the newsletter binary over loopback. Every step fails closed: a failed
+//!   push mails nobody, and the next run starts from the remote again. A slug the site
+//!   already carries as a dated post is never published twice.
+//!
+//! The receipt is the record. The desk reads it back (`publishing`, `deploying`,
+//! `published`, `needs attention`) and shows it; a run that dies mid-way is finished
+//! by the next one from the receipt, and a newsletter send that may have started is
+//! never repeated without a person.
 //!
 //! `date` is assigned here, not by the author. Series order is the date, so it is
 //! publish order, and two posts in a series can never share one.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc, Weekday};
+use chrono::{DateTime, NaiveDate, Utc};
 use chrono_tz::Tz;
+use sha2::{Digest, Sha256};
 
 use crate::{frontmatter, markdown, newsletter, og, pdf, speech};
 
 const DEFAULT_CONFIG: &str = "/etc/lindfors-publisher.toml";
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// The desk's database, as the `writing_publisher` role. Not in the config file: it
+/// is a credential, and `sec exec host/publisher` puts it in the environment.
+const DATABASE_ENV: &str = "PUBLISHER_DATABASE_URL";
 
 pub struct Config {
     pub repo: PathBuf,
-    /// The clone of lindfors-services the queue lives in, reset to its remote before
-    /// every read and pushed to after every publish; the audit trail is its history.
-    pub queue_repo: PathBuf,
-    /// The queue directory inside it.
-    pub queue: PathBuf,
-    pub weekday: Weekday,
-    pub hour: u32,
-    pub minute: u32,
+    /// The desk's content-addressed asset store, readable by the publisher.
+    pub assets: PathBuf,
+    /// Where a revision is laid out as a page bundle before it moves into the site.
+    pub export: PathBuf,
+    /// One JSON per slug the publisher has taken on. Outside the resettable clone,
+    /// readable by the desk.
+    pub receipts: PathBuf,
     pub timezone: Tz,
-    pub max_per_week: usize,
     pub site_url: String,
     /// The program that sends an issue, with the slug appended. On the host this is
     /// `sudo /opt/lindfors-newsletter/send-issue`, the one command the publisher may
@@ -68,20 +76,10 @@ impl Config {
             table.get(key).and_then(|v| v.as_str()).unwrap_or(default).to_string()
         };
         let n = |key: &str, default: i64| -> i64 { table.get(key).and_then(|v| v.as_integer()).unwrap_or(default) };
-
-        let weekday_text = s("weekday", "tuesday");
-        let weekday: Weekday = weekday_text
-            .parse()
-            .map_err(|_| format!("config: weekday {weekday_text:?} is not a day of the week"))?;
         let tz_text = s("timezone", "Europe/Oslo");
         let timezone: Tz = tz_text
             .parse()
             .map_err(|_| format!("config: timezone {tz_text:?} is unknown"))?;
-        let hour = n("hour", 8);
-        let minute = n("minute", 0);
-        if !(0..24).contains(&hour) || !(0..60).contains(&minute) {
-            return Err("config: hour must be 0-23 and minute 0-59".to_string());
-        }
         let send_command: Vec<String> = table
             .get("send_command")
             .and_then(|v| v.as_array())
@@ -90,23 +88,19 @@ impl Config {
         if send_command.is_empty() {
             return Err("config: send_command is empty".to_string());
         }
-
-        let queue_repo = PathBuf::from(s("queue_repo", "/srv/lindfors-publisher/services"));
-        let queue = table
-            .get("queue")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| queue_repo.join("queue"));
-
+        for stale in ["queue_repo", "queue", "weekday", "hour", "minute", "max_per_week"] {
+            if table.contains_key(stale) {
+                return Err(format!(
+                    "config: `{stale}` is from the queue-directory publisher; the desk's database decides now, remove it"
+                ));
+            }
+        }
         Ok(Config {
             repo: PathBuf::from(s("repo", "/srv/lindfors-publisher/site")),
-            queue_repo,
-            queue,
-            weekday,
-            hour: hour as u32,
-            minute: minute as u32,
+            assets: PathBuf::from(s("assets", "/srv/lindfors-writing/assets")),
+            export: PathBuf::from(s("export", "/srv/lindfors-publisher/export")),
+            receipts: PathBuf::from(s("receipts", "/srv/lindfors-publisher/receipts")),
             timezone,
-            max_per_week: n("max_per_week", 1).max(0) as usize,
             site_url: s("site_url", "https://lindfors.no").trim_end_matches('/').to_string(),
             send_command,
             wait_minutes: n("wait_minutes", 20).max(1) as u64,
@@ -121,142 +115,179 @@ impl Config {
     }
 }
 
-/// One queued post, as its sidecar describes it.
+/// One confirmed approval, as the desk's article records it, with the revision it
+/// names. `dir` is set once the revision has been exported as a bundle.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub slug: String,
     pub title: String,
-    pub queued_at: String,
-    /// `(iso_year, iso_week)` when pinned.
-    pub week: Option<(i32, u32)>,
-    /// Exact timestamps bypass the legacy weekly cadence.
-    pub publish_at: Option<DateTime<Utc>>,
+    pub publish_at: DateTime<Utc>,
     pub send: bool,
     pub subject: Option<String>,
     /// Submit to This Week in Rust: a trailer on the publish commit, acted on by the
     /// `twir` workflow in the repo, not by anything on this box.
     pub twir: bool,
+    pub revision: u64,
+    pub token: String,
+    pub digest: String,
+    pub markdown: String,
+    /// Asset name to content hash; the bytes are `<assets>/<hash>`.
+    pub assets: BTreeMap<String, String>,
     pub dir: PathBuf,
 }
 
 /// The commit trailer the `twir` workflow greps for; the two must agree.
 pub const TWIR_TRAILER: &str = "Syndicate: this-week-in-rust";
 
+/// The desk's content digest: SHA-256 over the JSON of `[markdown, assets]`, the
+/// same bytes `Revision::digest` hashes in the writing crate.
+pub fn digest(markdown: &str, assets: &BTreeMap<String, String>) -> String {
+    let bytes = serde_json::to_vec(&(markdown, assets)).expect("a revision serializes");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 impl Entry {
-    fn parse(dir: &Path, sidecar: &str) -> Result<Entry, String> {
-        let table: toml::Table = sidecar.parse().map_err(|e| format!("{}: {e}", dir.display()))?;
-        let get = |key: &str| table.get(key).and_then(|v| v.as_str()).map(String::from);
-        let slug = get("slug").ok_or_else(|| format!("{}: sidecar has no slug", dir.display()))?;
-        let week = match get("week") {
-            Some(w) => Some(parse_week(&w)?),
-            None => None,
-        };
-        let publish_at = match get("publish_at") {
-            Some(value) => Some(
-                DateTime::parse_from_rfc3339(&value)
-                    .map_err(|e| format!("invalid publish_at: {e}"))?
-                    .with_timezone(&Utc),
-            ),
-            None => None,
-        };
-        if week.is_some() && publish_at.is_some() {
-            return Err("week and publish_at are mutually exclusive".into());
-        }
+    /// The publishable approval in an article document, or the reason there is none.
+    /// `Ok(None)` is an article with nothing confirmed; `Err` is a confirmed approval
+    /// that does not add up, which is worth a line in the log and never a publish.
+    pub fn from_article(article: &serde_json::Value) -> Result<Option<Entry>, String> {
+        let slug = article["id"].as_str().unwrap_or("").to_string();
         if slug.is_empty()
             || !slug
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
             || slug.starts_with('-')
         {
-            return Err("invalid queue slug".into());
+            return Err("invalid article slug".into());
         }
-        Ok(Entry {
+        let approval = &article["approval"];
+        if approval["confirmed"] != true {
+            return Ok(None);
+        }
+        let revision = approval["revision"]
+            .as_u64()
+            .ok_or_else(|| format!("{slug}: approval names no revision"))?;
+        let token = approval["token"].as_str().unwrap_or("").to_string();
+        if token.is_empty() {
+            return Err(format!("{slug}: approval has no token"));
+        }
+        let r = article["revisions"]
+            .as_array()
+            .and_then(|rs| rs.iter().find(|r| r["id"].as_u64() == Some(revision)))
+            .ok_or_else(|| format!("{slug}: revision {revision} is not in the article"))?;
+        let markdown = r["markdown"].as_str().unwrap_or("").to_string();
+        let assets: BTreeMap<String, String> =
+            serde_json::from_value(r["assets"].clone()).map_err(|e| format!("{slug}: assets: {e}"))?;
+        let expected = approval["digest"].as_str().unwrap_or("");
+        if digest(&markdown, &assets) != expected {
+            return Err(format!("{slug}: the approved digest does not match revision {revision}"));
+        }
+        let validation = &article["validation"];
+        let validated = validation["revision"].as_u64() == Some(revision)
+            && validation["digest"].as_str() == Some(expected)
+            && validation["errors"].as_array().is_some_and(|e| e.is_empty());
+        if !validated {
+            return Err(format!("{slug}: revision {revision} has not passed validation"));
+        }
+        for (name, hash) in &assets {
+            let name_ok = !name.starts_with('.')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            let hash_ok = hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit());
+            if !name_ok || !hash_ok {
+                return Err(format!("{slug}: invalid asset {name}"));
+            }
+        }
+        let fm = frontmatter::parse(&markdown).map_err(|e| format!("{slug}: {e}"))?;
+        if !fm.draft {
+            return Err(format!("{slug}: the approved revision is not marked draft = true"));
+        }
+        let publish_at = approval["publish_at"].as_str().unwrap_or("");
+        let publish_at = DateTime::parse_from_rfc3339(publish_at)
+            .map_err(|e| format!("{slug}: publish_at: {e}"))?
+            .with_timezone(&Utc);
+        Ok(Some(Entry {
             slug,
+            title: article["title"].as_str().unwrap_or("").to_string(),
             publish_at,
-            title: get("title").unwrap_or_default(),
-            queued_at: get("queued_at").unwrap_or_default(),
-            week,
-            send: table.get("send").and_then(|v| v.as_bool()).unwrap_or(true),
-            subject: get("subject"),
-            twir: table.get("twir").and_then(|v| v.as_bool()).unwrap_or(false),
-            dir: dir.to_path_buf(),
-        })
+            send: approval["send"].as_bool().unwrap_or(true),
+            subject: approval["subject"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            twir: approval["twir"].as_bool().unwrap_or(false),
+            revision,
+            token,
+            digest: expected.to_string(),
+            markdown,
+            assets,
+            dir: PathBuf::new(),
+        }))
     }
 
-    pub fn slot_text(&self) -> String {
-        if let Some(at) = self.publish_at {
-            return at.to_rfc3339();
+    /// Lay the revision out the way `content/blog/<slug>/` and `static/` hold a post:
+    /// the Markdown as `post/index.md`, images beside it, the audio and speech files
+    /// under `static/`. Every asset's bytes are checked against their hash.
+    pub fn export(&mut self, assets: &Path, export: &Path) -> Result<(), String> {
+        let dir = export.join(&self.slug);
+        if dir.exists() {
+            fs::remove_dir_all(&dir).map_err(|e| format!("Failed to clear {}: {e}", dir.display()))?;
         }
-        match self.week {
-            Some((y, w)) => format!("{y}-W{w:02}"),
-            None => "next free slot".to_string(),
+        fs::create_dir_all(dir.join("post")).map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
+        fs::write(dir.join("post/index.md"), &self.markdown).map_err(|e| e.to_string())?;
+        for (name, hash) in &self.assets {
+            let blob = fs::read(assets.join(hash)).map_err(|e| format!("{}: asset {name}: {e}", self.slug))?;
+            if format!("{:x}", Sha256::digest(&blob)) != *hash {
+                return Err(format!("{}: asset {name} does not match its hash", self.slug));
+            }
+            let target = if name.ends_with(".mp3") {
+                dir.join("static/audio").join(format!("{}.mp3", self.slug))
+            } else if name == "audio.json" {
+                dir.join("static/audio").join(format!("{}.json", self.slug))
+            } else if name == "speech.txt" {
+                dir.join("static/speech").join(format!("{}.txt", self.slug))
+            } else {
+                dir.join("post").join(name)
+            };
+            fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+            fs::write(&target, blob).map_err(|e| format!("Failed to write {}: {e}", target.display()))?;
         }
+        self.dir = dir;
+        Ok(())
     }
 }
 
-/// `2026-W41` -> `(2026, 41)`, checked against the calendar.
-pub fn parse_week(text: &str) -> Result<(i32, u32), String> {
-    let bad = || format!("{text:?} is not an ISO week like 2026-W41");
-    let (year, week) = text.split_once("-W").ok_or_else(bad)?;
-    let year: i32 = year.parse().map_err(|_| bad())?;
-    let week: u32 = week.parse().map_err(|_| bad())?;
-    NaiveDate::from_isoywd_opt(year, week, Weekday::Mon).ok_or_else(bad)?;
-    Ok((year, week))
-}
-
-/// The entry the next run would publish, given the current ISO week.
-///
-/// A pin to this week or an earlier one goes first (earliest pin, then queue order), so
-/// a post that missed its week goes out at the next slot rather than never. Then the
-/// unpinned, in the order they were queued. Later pins wait.
-pub fn pick<'a>(entries: &'a [Entry], current: (i32, u32)) -> Option<&'a Entry> {
-    let mut pinned: Vec<&Entry> = entries
-        .iter()
-        .filter(|e| e.publish_at.is_none() && e.week.is_some_and(|w| w <= current))
-        .collect();
-    pinned.sort_by(|a, b| a.week.cmp(&b.week).then_with(|| a.queued_at.cmp(&b.queued_at)));
-    if let Some(first) = pinned.first() {
-        return Some(first);
+/// What the publisher would refuse a post for, asked before it is confirmed: the
+/// writing desk's validation runs this. A post to be published has `draft = true`
+/// (the publisher removes it), no citation marker left (this build cannot resolve
+/// one), and a title and a description.
+pub fn check(content: &str) -> Result<(), String> {
+    let fm = frontmatter::parse(content)?;
+    if !fm.draft {
+        return Err("the post is not a draft: a post to be published has `draft = true`, and the publisher removes it on the day".into());
     }
-    let mut free: Vec<&Entry> = entries
-        .iter()
-        .filter(|e| e.publish_at.is_none() && e.week.is_none())
-        .collect();
-    free.sort_by(|a, b| a.queued_at.cmp(&b.queued_at));
-    free.first().copied()
+    let (_, body) = frontmatter::split(content)?;
+    let (masked, _) = crate::codemask::mask(body);
+    let pending = crate::markers::scan(&masked);
+    if !pending.is_empty() {
+        return Err(format!(
+            "{} unresolved citation marker(s); resolve citations first, the publisher cannot",
+            pending.len()
+        ));
+    }
+    if fm.title.is_empty() || fm.title == "Untitled" || fm.description.is_empty() {
+        return Err("a title and a description are required".into());
+    }
+    Ok(())
 }
 
-/// Exact due entries are selected independently of the weekly cadence and cap.
-pub fn pick_due(entries: &[Entry], now: DateTime<Utc>, current: (i32, u32), legacy_allowed: bool) -> Option<&Entry> {
+/// The earliest entry that is due, ties by slug. Later ones wait.
+pub fn pick_due(entries: &[Entry], now: DateTime<Utc>) -> Option<&Entry> {
     entries
         .iter()
-        .filter(|e| e.publish_at.is_some_and(|at| at <= now))
-        .min_by(|a, b| {
-            a.publish_at
-                .cmp(&b.publish_at)
-                .then_with(|| a.queued_at.cmp(&b.queued_at))
-                .then_with(|| a.slug.cmp(&b.slug))
-        })
-        .or_else(|| if legacy_allowed { pick(entries, current) } else { None })
-}
-
-/// This week's slot: the configured weekday at the configured hour, in the week `now`
-/// falls in. A run before it does nothing; after it, the week's post goes out on the
-/// first run, whichever hour that turns out to be.
-pub fn slot(now: DateTime<Tz>, weekday: Weekday, hour: u32, minute: u32) -> DateTime<Tz> {
-    let week = now.iso_week();
-    let date = NaiveDate::from_isoywd_opt(week.year(), week.week(), weekday).expect("a weekday in a real week");
-    let local = date.and_hms_opt(hour, minute, 0).expect("a valid time");
-    // A time a DST transition skipped resolves to the moment after the gap.
-    now.timezone()
-        .from_local_datetime(&local)
-        .earliest()
-        .unwrap_or_else(|| now.timezone().from_utc_datetime(&(local + chrono::Duration::hours(1))))
-}
-
-fn week_of(date: NaiveDate) -> (i32, u32) {
-    let w = date.iso_week();
-    (w.year(), w.week())
+        .filter(|e| e.publish_at <= now)
+        .min_by(|a, b| a.publish_at.cmp(&b.publish_at).then_with(|| a.slug.cmp(&b.slug)))
 }
 
 /// Set `date` and drop `draft` in the top-level table of a post's frontmatter, leaving
@@ -318,7 +349,7 @@ pub fn rewrite_frontmatter(content: &str, date: NaiveDate) -> Result<String, Str
     Ok(result)
 }
 
-/// What the repo already holds, as far as the slot and series rules care.
+/// What the repo already holds, as far as the never-twice and series rules care.
 struct Post {
     slug: String,
     date: Option<NaiveDate>,
@@ -347,8 +378,7 @@ fn post_info(slug: &str, content: &str) -> Result<Post, String> {
     let date = table.get("date").and_then(|v| match v {
         toml::Value::Datetime(d) => d
             .date
-            .map(|d| NaiveDate::from_ymd_opt(d.year as i32, d.month as u32, d.day as u32))
-            .flatten(),
+            .and_then(|d| NaiveDate::from_ymd_opt(d.year as i32, d.month as u32, d.day as u32)),
         toml::Value::String(s) => NaiveDate::parse_from_str(&s[..s.len().min(10)], "%Y-%m-%d").ok(),
         _ => None,
     });
@@ -368,36 +398,67 @@ fn post_info(slug: &str, content: &str) -> Result<Post, String> {
     })
 }
 
-fn published_in_week(posts: &[Post], week: (i32, u32)) -> Vec<&Post> {
-    posts
-        .iter()
-        .filter(|p| !p.draft && p.date.is_some_and(|d| week_of(d) == week))
-        .collect()
+// ---------------------------------------------------------------------------
+// The desk's database
+// ---------------------------------------------------------------------------
+
+fn connect() -> Result<postgres::Client, String> {
+    let url = std::env::var(DATABASE_ENV)
+        .map_err(|_| format!("{DATABASE_ENV} is not set; run under `sec exec host/publisher`"))?;
+    postgres::Client::connect(&url, postgres::NoTls)
+        .map_err(|_| "cannot connect to the writing database".to_string())
 }
 
-pub fn read_queue(queue: &Path) -> Result<Vec<Entry>, String> {
-    if !queue.is_dir() {
-        return Ok(Vec::new());
-    }
+/// Every confirmed approval the desk holds, as entries, and the reasons the ones that
+/// do not add up were left out.
+fn read_confirmed(client: &mut postgres::Client) -> Result<(Vec<Entry>, Vec<String>), String> {
+    let rows = client
+        .query(
+            "SELECT document FROM writing_articles WHERE document->'approval'->>'confirmed' = 'true' ORDER BY id",
+            &[],
+        )
+        .map_err(|e| format!("reading approvals: {e}"))?;
     let mut entries = Vec::new();
-    for entry in fs::read_dir(queue).map_err(|e| format!("Failed to read {}: {e}", queue.display()))? {
-        let dir = entry.map_err(|e| e.to_string())?.path();
-        let sidecar = dir.join("schedule.toml");
-        if !sidecar.is_file() {
-            continue;
+    let mut skipped = Vec::new();
+    for row in rows {
+        let document: serde_json::Value = row.get(0);
+        match Entry::from_article(&document) {
+            Ok(Some(entry)) => entries.push(entry),
+            Ok(None) => {}
+            Err(reason) => skipped.push(reason),
         }
-        let text = fs::read_to_string(&sidecar).map_err(|e| format!("Failed to read {}: {e}", sidecar.display()))?;
-        let entry = Entry::parse(&dir, &text)?;
-        if !dir.join("post/index.md").is_file() {
-            return Err(format!("{}: no post/index.md", dir.display()));
-        }
-        if dir.file_name().and_then(|n| n.to_str()) != Some(entry.slug.as_str()) {
-            return Err(format!("{}: sidecar says slug {}", dir.display(), entry.slug));
-        }
-        entries.push(entry);
     }
-    entries.sort_by(|a, b| a.queued_at.cmp(&b.queued_at));
-    Ok(entries)
+    Ok((entries, skipped))
+}
+
+/// Take an approval on: under the article's advisory lock, the lock the desk holds
+/// while it applies a command, read the article again, check the approval is the one
+/// that was picked and still confirmed, and write the first receipt. Once the receipt
+/// exists the desk refuses to withdraw, so a withdrawal and a publication cannot cross.
+fn take_on(client: &mut postgres::Client, config: &Config, entry: &Entry) -> Result<PathBuf, String> {
+    let mut tx = client.transaction().map_err(|e| e.to_string())?;
+    tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))", &[&entry.slug])
+        .map_err(|e| format!("locking {}: {e}", entry.slug))?;
+    let row = tx
+        .query_opt("SELECT document FROM writing_articles WHERE id = $1", &[&entry.slug])
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{}: the article is gone", entry.slug))?;
+    let document: serde_json::Value = row.get(0);
+    let current = Entry::from_article(&document)?
+        .filter(|e| e.token == entry.token && e.revision == entry.revision && e.digest == entry.digest)
+        .ok_or_else(|| format!("{}: the approval changed under us; nothing published", entry.slug))?;
+    debug_assert_eq!(current.slug, entry.slug);
+    fs::create_dir_all(&config.receipts).map_err(|e| e.to_string())?;
+    let path = config.receipts.join(format!("{}.json", entry.slug));
+    if path.exists() {
+        return Err(format!("{}: a receipt already exists; recovery owns it", entry.slug));
+    }
+    write_receipt(
+        &path,
+        &serde_json::json!({"slug":entry.slug,"approval":entry.token,"revision":entry.revision,"status":"publishing","send":entry.send,"subject":entry.subject,"commit":null,"mail_started":false}),
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -410,25 +471,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
     match sub {
         "run" | "next" => {
             let config = Config::load(Path::new(&config_path))?;
-            let now_flag = args.iter().any(|a| a == "--now");
-            let force = args.iter().any(|a| a == "--force");
             let dry = sub == "next" || args.iter().any(|a| a == "--dry-run");
-            publish(&config, now_flag, force, dry)
+            publish(&config, dry)
         }
         "list" => {
             let config = Config::load(Path::new(&config_path))?;
             list(&config)
         }
-        "unqueue" => {
-            let config = Config::load(Path::new(&config_path))?;
-            let slug = args.get(1).ok_or("Usage: site-tools publish unqueue <slug>")?;
-            sync_queue(&config)?;
-            let dir = config.queue.join(slug);
-            if !dir.join("schedule.toml").is_file() {
-                return Err(format!("{slug} is not in the queue"));
-            }
-            let hash = drop_entry(&config, slug, &format!("Unqueue: {slug}"))?;
-            println!("Removed {slug} from the queue ({hash}).");
+        "check" => {
+            let path = args.get(1).ok_or("Usage: site-tools publish check <post/index.md>")?;
+            let content = fs::read_to_string(path).map_err(|e| format!("Failed to read {path}: {e}"))?;
+            check(&content)?;
+            println!("ok");
             Ok(())
         }
         "-h" | "--help" | "help" | "" => {
@@ -444,55 +498,52 @@ pub fn run(args: &[String]) -> Result<(), String> {
 }
 
 fn print_usage() {
-    eprintln!("site-tools publish — Publish the next queued post (runs on the box, from cron)");
+    eprintln!("site-tools publish — Publish the next confirmed revision (runs on the box, from cron)");
     eprintln!();
     eprintln!("Subcommands:");
-    eprintln!("  run [--now] [--force] [--dry-run]   Publish if the week's slot has passed and the week is free");
-    eprintln!("                                      --now ignores the hour, --force the one-per-week rule");
-    eprintln!("  next                                What `run` would do, changing nothing");
-    eprintln!("  list                                The queue, then what `next` says");
-    eprintln!("  unqueue <slug>                      Remove an entry");
+    eprintln!("  run [--dry-run]   Finish any publication in progress, then publish the earliest due approval");
+    eprintln!("  next              What `run` would do, changing nothing");
+    eprintln!("  list              Every confirmed approval, with its time and its receipt");
+    eprintln!("  check <index.md>  The pre-flight refusals, for the writing desk's validation");
     eprintln!();
-    eprintln!("  --config <path>                     Default {DEFAULT_CONFIG}");
+    eprintln!("  --config <path>   Default {DEFAULT_CONFIG}");
+    eprintln!("  {DATABASE_ENV}    The desk's database, as the writing_publisher role (from the host/publisher bundle)");
+    eprintln!();
+    eprintln!("A post is confirmed in the writing desk, not here. Withdraw it there too, before this");
+    eprintln!("has taken it on; afterwards its receipt is the record and a person finishes it.");
 }
 
 fn list(config: &Config) -> Result<(), String> {
-    sync_queue(config)?;
-    let entries = read_queue(&config.queue)?;
-    if entries.is_empty() {
-        println!("Queue is empty ({}).", config.queue.display());
-    } else {
-        println!("Queue ({}):", config.queue.display());
-        for e in &entries {
-            println!(
-                "  {:<40} {:<16} {}  {}  queued {}{}",
-                e.slug,
-                e.slot_text(),
-                if e.send { "newsletter" } else { "no mail   " },
-                if e.twir { "twir" } else { "    " },
-                e.queued_at,
-                e.subject
-                    .as_ref()
-                    .map(|s| format!("  subject: {s}"))
-                    .unwrap_or_default()
-            );
-        }
+    let mut client = connect()?;
+    let (entries, skipped) = read_confirmed(&mut client)?;
+    if entries.is_empty() && skipped.is_empty() {
+        println!("No confirmed approvals.");
+    }
+    for e in &entries {
+        let receipt = read_receipt(&config.receipts.join(format!("{}.json", e.slug)));
+        println!(
+            "  {:<40} {}  revision {:<3} {}  {}  {}",
+            e.slug,
+            e.publish_at.with_timezone(&config.timezone).format("%Y-%m-%d %H:%M %Z"),
+            e.revision,
+            if e.send { "newsletter" } else { "no mail   " },
+            if e.twir { "twir" } else { "    " },
+            receipt
+                .as_ref()
+                .and_then(|r| r["status"].as_str().map(|s| format!("receipt: {s}")))
+                .unwrap_or_else(|| "waiting".into())
+        );
+    }
+    for reason in &skipped {
+        println!("  skipped: {reason}");
     }
     println!();
-    publish(config, false, false, true)
+    publish(config, true)
 }
 
-fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<(), String> {
-    let now = Utc::now().with_timezone(&config.timezone);
-    let current = (now.iso_week().year(), now.iso_week().week());
-    let slot = slot(now, config.weekday, config.hour, config.minute);
-    let week_text = format!("{}-W{:02}", current.0, current.1);
-
-    println!(
-        "now {}  slot {}",
-        now.format("%Y-%m-%d %H:%M %Z"),
-        slot.format("%a %Y-%m-%d %H:%M")
-    );
+fn publish(config: &Config, dry: bool) -> Result<(), String> {
+    let now = Utc::now();
+    println!("now {}", now.with_timezone(&config.timezone).format("%Y-%m-%d %H:%M %Z"));
 
     if !dry {
         // The clone is a robot's. Whatever it holds, the run starts from the branch it
@@ -500,33 +551,40 @@ fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<()
         reset_to_remote(config, &config.repo)?;
         recover_receipts(config)?;
     }
-    sync_queue(config)?;
-
+    let mut client = connect()?;
+    let (mut entries, skipped) = read_confirmed(&mut client)?;
+    for reason in &skipped {
+        println!("skipped: {reason}");
+    }
     let posts = read_posts(&config.repo)?;
-    let taken = published_in_week(&posts, current);
-    let mut entries = read_queue(&config.queue)?;
-    // Out already, whatever the queue says: a queue push that failed after the site
-    // push, or a post published by hand. Never twice.
+    // Out already, whatever the desk says, or already taken on by an earlier run
+    // whose receipt recovery owns. Never twice.
     entries.retain(|e| {
-        let out = posts.iter().any(|p| p.slug == e.slug && !p.draft && p.date.is_some());
-        if out {
-            println!("{}: already published on the site; remove it from the queue", e.slug);
+        if posts.iter().any(|p| p.slug == e.slug && !p.draft && p.date.is_some()) {
+            println!("{}: already published on the site; withdraw it in the desk", e.slug);
+            return false;
         }
-        !out
+        if config.receipts.join(format!("{}.json", e.slug)).exists() {
+            println!("{}: has a receipt; recovery owns it", e.slug);
+            return false;
+        }
+        true
     });
-    let legacy_allowed = (now >= slot || now_flag) && (taken.len() < config.max_per_week || force);
-    let Some(entry) = pick_due(&entries, now.with_timezone(&Utc), current, legacy_allowed) else {
-        if entries.is_empty() {
-            println!("{week_text}: queue is empty; nothing to do.");
-        } else {
-            println!("{week_text}: every queued post is pinned to a later week; nothing to do.");
+    let Some(entry) = pick_due(&entries, now) else {
+        match entries.iter().map(|e| e.publish_at).min() {
+            None => println!("nothing confirmed and waiting; nothing to do."),
+            Some(next) => println!(
+                "nothing due; the next is at {}.",
+                next.with_timezone(&config.timezone).format("%Y-%m-%d %H:%M %Z")
+            ),
         }
         return Ok(());
     };
 
     println!(
-        "{week_text}: {} would go out{}{}{}",
+        "{} revision {} would go out{}{}{}",
         entry.slug,
+        entry.revision,
         if entry.send {
             " with a newsletter"
         } else {
@@ -543,18 +601,30 @@ fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<()
         return Ok(());
     }
 
+    let receipt_path = take_on(&mut client, config, entry)?;
+    drop(client);
+    let mut receipt = read_receipt(&receipt_path).ok_or("the receipt just written cannot be read")?;
+    let mut entry = entry.clone();
+    if let Err(e) = entry.export(&config.assets, &config.export) {
+        // Nothing has moved. The receipt says why, and stays, so a person looks: an
+        // asset that does not match its hash is not something the next run fixes.
+        receipt["status"] = serde_json::json!("needs attention");
+        receipt["error"] = serde_json::json!(e);
+        write_receipt(&receipt_path, &receipt)?;
+        return Err(e);
+    }
+
     // --- Move the bundle in and date it -------------------------------------------
-    let date = now.date_naive();
+    let date = now.with_timezone(&config.timezone).date_naive();
     let dest = config.repo.join("content/blog").join(&entry.slug);
     if dest.exists() {
         fs::remove_dir_all(&dest).map_err(|e| format!("Failed to clear {}: {e}", dest.display()))?;
     }
-    crate::schedule::copy_dir(&entry.dir.join("post"), &dest)?;
+    copy_dir(&entry.dir.join("post"), &dest)?;
     let statics = entry.dir.join("static");
     if statics.is_dir() {
-        crate::schedule::copy_dir(&statics, &config.repo.join("static"))?;
+        copy_dir(&statics, &config.repo.join("static"))?;
     }
-    let _ = fs::remove_file(dest.join("schedule.toml"));
 
     let index = dest.join("index.md");
     let content = fs::read_to_string(&index).map_err(|e| format!("Failed to read {}: {e}", index.display()))?;
@@ -562,10 +632,14 @@ fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<()
     let info = post_info(&entry.slug, &rewritten)?;
     for other in posts.iter().filter(|p| p.slug != entry.slug && !p.draft) {
         if other.date == Some(date) && other.series.iter().any(|s| info.series.contains(s)) {
-            return Err(format!(
+            let e = format!(
                 "{} is in the same series as {} and would share its date {date}; series order is the date",
                 entry.slug, other.slug
-            ));
+            );
+            receipt["status"] = serde_json::json!("needs attention");
+            receipt["error"] = serde_json::json!(e);
+            write_receipt(&receipt_path, &receipt)?;
+            return Err(e);
         }
     }
     fs::write(&index, &rewritten).map_err(|e| format!("Failed to write {}: {e}", index.display()))?;
@@ -576,24 +650,26 @@ fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<()
     let step = |name: &str, r: Result<(), String>| {
         r.map_err(|e| format!("{name} failed, nothing pushed (the next run resets the clone): {e}"))
     };
-    step("markdown all", markdown::gen_all())?;
-    step("speech all", speech::gen_all())?;
-    step("pdf all", pdf::gen_all())?;
-    step("og all", og::gen_all())?;
-    if entry.send {
-        step("newsletter gen", newsletter::gen(&index.to_string_lossy()))?;
+    let derived = step("markdown all", markdown::gen_all())
+        .and_then(|()| step("speech all", speech::gen_all()))
+        .and_then(|()| step("pdf all", pdf::gen_all()))
+        .and_then(|()| step("og all", og::gen_all()))
+        .and_then(|()| {
+            if entry.send {
+                step("newsletter gen", newsletter::gen(&index.to_string_lossy()))
+            } else {
+                Ok(())
+            }
+        });
+    if let Err(e) = derived {
+        // Nothing pushed: the receipt goes, so the next run tries again from the desk.
+        let _ = fs::remove_file(&receipt_path);
+        return Err(e);
     }
-
-    // A persistent journal lives outside both resettable clones.
-    let receipt_dir = receipt_dir(config);
-    fs::create_dir_all(&receipt_dir).map_err(|e| e.to_string())?;
-    let receipt_path = receipt_dir.join(format!("{}.json", entry.slug));
-    let mut receipt = serde_json::json!({"slug":entry.slug,"status":"publishing","send":entry.send,"subject":entry.subject,"commit":null,"queue_removed":false,"mail_started":false});
-    write_receipt(&receipt_path, &receipt)?;
 
     // --- Commit and push ------------------------------------------------------------
     git(&config.repo, &["add", "-A"])?;
-    let message = commit_message(entry);
+    let message = commit_message(&entry);
     git(&config.repo, &["commit", "--quiet", "-m", &message])?;
     let hash = git(&config.repo, &["rev-parse", "--short", "HEAD"])?;
     receipt["commit"] = serde_json::json!(git(&config.repo, &["rev-parse", "HEAD"])?.trim());
@@ -603,17 +679,15 @@ fn publish(config: &Config, now_flag: bool, force: bool, dry: bool) -> Result<()
         &["push", "--quiet", &config.remote, &format!("HEAD:{}", config.branch)],
     )?;
     println!("pushed {} as {}", entry.slug, hash.trim());
+    let _ = fs::remove_dir_all(&entry.dir);
 
     receipt["status"] = serde_json::json!("deploying");
     write_receipt(&receipt_path, &receipt)?;
     finish_receipt(config, &receipt_path, &mut receipt)
 }
 
-/// The queue gateway and cron wrapper hold the same external lock for all calls.
-fn receipt_dir(config: &Config) -> PathBuf {
-    std::env::var_os("WRITING_RECEIPTS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config.queue_repo.parent().unwrap_or(Path::new(".")).join("receipts"))
+fn read_receipt(path: &Path) -> Option<serde_json::Value> {
+    fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok())
 }
 fn write_receipt(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     use std::io::Write;
@@ -631,16 +705,10 @@ fn write_receipt(path: &Path, value: &serde_json::Value) -> Result<(), String> {
         .and_then(|f| f.sync_all())
         .map_err(|e| e.to_string())
 }
+/// From a pushed commit to a settled receipt: wait for the site, then mail once. A
+/// send that may have started is handed to a person, never repeated.
 fn finish_receipt(config: &Config, path: &Path, receipt: &mut serde_json::Value) -> Result<(), String> {
     let slug = receipt["slug"].as_str().ok_or("receipt missing slug")?.to_string();
-    if receipt["queue_removed"] != true {
-        sync_queue(config)?;
-        if config.queue.join(&slug).exists() {
-            drop_entry(config, &slug, &format!("Published: {slug}"))?;
-        }
-        receipt["queue_removed"] = serde_json::json!(true);
-        write_receipt(path, receipt)?;
-    }
     receipt["status"] = serde_json::json!("deploying");
     write_receipt(path, receipt)?;
     let page = format!("{}/blog/{slug}/", config.site_url);
@@ -685,8 +753,12 @@ fn finish_receipt(config: &Config, path: &Path, receipt: &mut serde_json::Value)
     receipt["error"] = serde_json::Value::Null;
     write_receipt(path, receipt)
 }
+/// Receipts a previous run left unfinished. One whose commit reached the remote is
+/// finished from where it stopped; one whose commit never landed, or that has no
+/// commit, is discarded, so the approval is picked up again as if untouched. Settled
+/// receipts (`published`, `needs attention`) are left for a person.
 fn recover_receipts(config: &Config) -> Result<(), String> {
-    let dir = receipt_dir(config);
+    let dir = &config.receipts;
     if !dir.exists() {
         return Ok(());
     }
@@ -721,7 +793,7 @@ fn recover_receipts(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-/// `Publish: <title>`, plus the syndication trailer when the sidecar asked for it.
+/// `Publish: <title>`, plus the syndication trailer when the approval asked for it.
 /// The trailer is what the `twir` workflow reads off the push; nothing here talks to
 /// GitHub's API, so the box needs no token beyond its deploy key.
 fn commit_message(entry: &Entry) -> String {
@@ -801,41 +873,6 @@ fn reset_to_remote(config: &Config, repo: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The queue as the workstation last pushed it.
-fn sync_queue(config: &Config) -> Result<(), String> {
-    if !config.queue_repo.join(".git").exists() {
-        return Err(format!(
-            "{} is not a git clone; see host/README.md",
-            config.queue_repo.display()
-        ));
-    }
-    reset_to_remote(config, &config.queue_repo).map_err(|e| format!("queue: {e}"))
-}
-
-/// Remove an entry from the queue with a commit, pushed. Returns the short hash.
-fn drop_entry(config: &Config, slug: &str, message: &str) -> Result<String, String> {
-    let rel = config
-        .queue
-        .strip_prefix(&config.queue_repo)
-        .map_err(|_| {
-            format!(
-                "{} is not inside {}",
-                config.queue.display(),
-                config.queue_repo.display()
-            )
-        })?
-        .join(slug);
-    let rel = rel.to_string_lossy().replace('\\', "/");
-    git(&config.queue_repo, &["rm", "-r", "--quiet", "--", &rel])?;
-    git(&config.queue_repo, &["commit", "--quiet", "-m", message])?;
-    let hash = git(&config.queue_repo, &["rev-parse", "--short", "HEAD"])?;
-    git(
-        &config.queue_repo,
-        &["push", "--quiet", &config.remote, &format!("HEAD:{}", config.branch)],
-    )?;
-    Ok(hash.trim().to_string())
-}
-
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
@@ -853,27 +890,64 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Copy a directory tree. The bundle is small: a markdown file and a few images.
+pub fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
+    fs::create_dir_all(to).map_err(|e| format!("Failed to create {}: {e}", to.display()))?;
+    for entry in fs::read_dir(from).map_err(|e| format!("Failed to read {}: {e}", from.display()))? {
+        let entry = entry.map_err(|e| format!("Failed to read {}: {e}", from.display()))?;
+        let src: PathBuf = entry.path();
+        let dst = to.join(entry.file_name());
+        if src.is_dir() {
+            copy_dir(&src, &dst)?;
+        } else {
+            fs::copy(&src, &dst).map_err(|e| format!("Failed to copy {}: {e}", src.display()))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn entry(slug: &str, queued_at: &str, week: Option<(i32, u32)>) -> Entry {
+    fn entry(slug: &str, publish_at: &str) -> Entry {
         Entry {
             slug: slug.into(),
             title: slug.into(),
-            queued_at: queued_at.into(),
-            week,
-            publish_at: None,
+            publish_at: DateTime::parse_from_rfc3339(publish_at).unwrap().with_timezone(&Utc),
             send: true,
             subject: None,
             twir: false,
+            revision: 1,
+            token: "t".into(),
+            digest: String::new(),
+            markdown: String::new(),
+            assets: BTreeMap::new(),
             dir: PathBuf::from(slug),
         }
     }
 
+    /// An article document the way the desk stores it, with one confirmed approval.
+    fn article(slug: &str, markdown: &str, assets: BTreeMap<String, String>) -> serde_json::Value {
+        let d = digest(markdown, &assets);
+        serde_json::json!({
+            "id": slug, "title": "A title", "head": 2,
+            "revisions": [
+                {"id": 1, "parent": 0, "markdown": "old", "assets": {}, "author": "Emil", "summary": "", "created_at": "", "proposal": false},
+                {"id": 2, "parent": 1, "markdown": markdown, "assets": assets, "author": "Emil", "summary": "", "created_at": "", "proposal": false}
+            ],
+            "validation": {"revision": 2, "digest": d, "renderer": "zola", "errors": []},
+            "approval": {"token": "tok", "revision": 2, "digest": d, "publish_at": "2030-09-11T10:00:00+02:00",
+                          "send": true, "subject": "", "twir": true, "confirmed": true},
+            "status": "queued"
+        })
+    }
+
+    const DRAFT: &str = "+++\ntitle = \"T\"\ndescription = \"D\"\ndraft = true\n+++\n\nBody\n";
+
     #[test]
     fn commit_message_carries_the_trailer_only_when_asked() {
-        let mut e = entry("a-post", "2026-09-01T00:00:00Z", None);
+        let mut e = entry("a-post", "2026-09-01T00:00:00Z");
         e.title = "A title".into();
         assert_eq!(commit_message(&e), "Publish: A title");
         e.twir = true;
@@ -881,51 +955,99 @@ mod tests {
     }
 
     #[test]
-    fn weeks_parse_and_reject() {
-        assert_eq!(parse_week("2026-W41").unwrap(), (2026, 41));
-        assert_eq!(parse_week("2026-W01").unwrap(), (2026, 1));
-        assert!(parse_week("2026-41").is_err());
-        assert!(parse_week("2026-W54").is_err());
-        assert!(parse_week("2026-W0").is_err());
+    fn the_digest_is_the_desks() {
+        // sha256 of the JSON `["m",{}]`, what the writing crate's Revision::digest hashes.
+        assert_eq!(
+            digest("m", &BTreeMap::new()),
+            format!("{:x}", Sha256::digest(br#"["m",{}]"#))
+        );
     }
 
     #[test]
-    fn pinned_to_this_week_or_earlier_beats_the_free_queue() {
-        let entries = vec![
-            entry("free-first", "2026-09-01T00:00:00Z", None),
-            entry("pinned-later", "2026-09-02T00:00:00Z", Some((2026, 45))),
-            entry("pinned-now", "2026-09-03T00:00:00Z", Some((2026, 41))),
-            entry("pinned-missed", "2026-09-04T00:00:00Z", Some((2026, 40))),
-        ];
-        assert_eq!(pick(&entries, (2026, 41)).unwrap().slug, "pinned-missed");
-        assert_eq!(pick(&entries, (2026, 39)).unwrap().slug, "free-first");
-        assert_eq!(pick(&entries[..2], (2026, 41)).unwrap().slug, "free-first");
-        assert_eq!(pick(&entries[1..2], (2026, 41)), None);
+    fn a_confirmed_approval_becomes_an_entry() {
+        let a = article("a-post", DRAFT, BTreeMap::from([("hero.webp".into(), "a".repeat(64))]));
+        let e = Entry::from_article(&a).unwrap().unwrap();
+        assert_eq!(e.slug, "a-post");
+        assert_eq!(e.revision, 2);
+        assert_eq!(e.token, "tok");
+        assert!(e.twir);
+        assert_eq!(e.subject, None);
+        assert_eq!(e.publish_at.to_rfc3339(), "2030-09-11T08:00:00+00:00");
+        assert_eq!(e.markdown, DRAFT);
     }
 
     #[test]
-    fn free_queue_goes_in_queued_order() {
-        let entries = vec![
-            entry("second", "2026-09-02T00:00:00Z", None),
-            entry("first", "2026-09-01T00:00:00Z", None),
-        ];
-        assert_eq!(pick(&entries, (2026, 41)).unwrap().slug, "first");
+    fn an_unconfirmed_article_is_nothing_and_a_broken_approval_is_a_reason() {
+        let mut a = article("a-post", DRAFT, BTreeMap::new());
+        a["approval"]["confirmed"] = serde_json::json!(false);
+        assert_eq!(Entry::from_article(&a).unwrap(), None);
+        // The digest names other content than the revision holds.
+        let mut a = article("a-post", DRAFT, BTreeMap::new());
+        a["approval"]["digest"] = serde_json::json!("0".repeat(64));
+        assert!(Entry::from_article(&a).unwrap_err().contains("digest"));
+        // Validation is for an earlier revision.
+        let mut a = article("a-post", DRAFT, BTreeMap::new());
+        a["validation"]["revision"] = serde_json::json!(1);
+        assert!(Entry::from_article(&a).unwrap_err().contains("validation"));
+        // Not a draft.
+        let a = article("a-post", "+++\ntitle = \"T\"\n+++\nBody\n", BTreeMap::new());
+        assert!(Entry::from_article(&a).unwrap_err().contains("draft"));
+        // A bad asset name.
+        let a = article("a-post", DRAFT, BTreeMap::from([("../x.webp".into(), "a".repeat(64))]));
+        assert!(Entry::from_article(&a).unwrap_err().contains("asset"));
+        // A bad slug.
+        let a = article("Bad Slug", DRAFT, BTreeMap::new());
+        assert!(Entry::from_article(&a).is_err());
     }
 
     #[test]
-    fn slot_is_the_weekday_in_the_current_iso_week() {
-        let tz: Tz = "Europe/Oslo".parse().unwrap();
-        // Thursday 2026-10-08 is in ISO week 41, whose Tuesday is 2026-10-06.
-        let now = tz.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap();
-        let s = slot(now, Weekday::Tue, 8, 0);
-        assert_eq!(s.format("%Y-%m-%d %H:%M").to_string(), "2026-10-06 08:00");
-        assert!(now > s);
-        // Monday of the same week, before the slot.
-        let monday = tz.with_ymd_and_hms(2026, 10, 5, 9, 0, 0).unwrap();
-        assert!(monday < slot(monday, Weekday::Tue, 8, 0));
-        // A Sunday belongs to the week that ends on it, not the one that starts after.
-        let sunday = tz.with_ymd_and_hms(2026, 10, 11, 9, 0, 0).unwrap();
-        assert_eq!(slot(sunday, Weekday::Tue, 8, 0).day(), 6);
+    fn export_lays_the_revision_out_as_a_bundle_and_checks_every_asset() {
+        let root = std::env::temp_dir().join(format!("publisher-export-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let assets = root.join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        let webp = b"RIFFwebp";
+        let mp3 = b"ID3mp3";
+        let h_webp = format!("{:x}", Sha256::digest(webp));
+        let h_mp3 = format!("{:x}", Sha256::digest(mp3));
+        fs::write(assets.join(&h_webp), webp).unwrap();
+        fs::write(assets.join(&h_mp3), mp3).unwrap();
+        let manifest = BTreeMap::from([
+            ("hero.webp".to_string(), h_webp.clone()),
+            ("voice.mp3".to_string(), h_mp3.clone()),
+        ]);
+        let mut e = Entry::from_article(&article("a-post", DRAFT, manifest)).unwrap().unwrap();
+        e.export(&assets, &root.join("export")).unwrap();
+        assert_eq!(fs::read_to_string(e.dir.join("post/index.md")).unwrap(), DRAFT);
+        assert_eq!(fs::read(e.dir.join("post/hero.webp")).unwrap(), webp);
+        assert_eq!(fs::read(e.dir.join("static/audio/a-post.mp3")).unwrap(), mp3);
+        // A blob that does not match its hash stops the export.
+        fs::write(assets.join(&h_webp), b"tampered").unwrap();
+        assert!(e.export(&assets, &root.join("export")).unwrap_err().contains("hash"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_pre_flight_check_refuses_what_the_publisher_would() {
+        assert!(check(DRAFT).is_ok());
+        assert!(check("+++\ntitle = \"T\"\ndescription = \"D\"\n+++\nBody\n").unwrap_err().contains("draft"));
+        assert!(check("+++\ntitle = \"T\"\ndescription = \"D\"\ndraft = true\n+++\nSee [@Smith2020].\n")
+            .unwrap_err()
+            .contains("citation"));
+        assert!(check("+++\ntitle = \"T\"\ndraft = true\n+++\nBody\n").unwrap_err().contains("description"));
+    }
+
+    #[test]
+    fn the_earliest_due_entry_goes_and_future_ones_wait() {
+        let now = DateTime::parse_from_rfc3339("2026-09-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let due = entry("due", "2026-09-11T11:59:00Z");
+        let earlier = entry("earlier", "2026-09-10T09:00:00Z");
+        let future = entry("future", "2026-09-11T12:01:00Z");
+        assert_eq!(pick_due(&[due.clone(), future.clone(), earlier.clone()], now).unwrap().slug, "earlier");
+        assert_eq!(pick_due(&[due, future.clone()], now).unwrap().slug, "due");
+        assert!(pick_due(&[future], now).is_none());
     }
 
     #[test]
@@ -962,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn posts_in_a_week_count_dated_non_drafts() {
+    fn post_info_reads_dates_drafts_and_series() {
         let a = post_info("a", "+++\ntitle = \"A\"\ndate = 2026-10-06\n+++\n").unwrap();
         let b = post_info(
             "b",
@@ -974,100 +1096,28 @@ mod tests {
             "+++\ntitle = \"C\"\ndate = 2026-10-13\n[taxonomies]\nseries = [\"S\"]\n+++\n",
         )
         .unwrap();
-        let posts = vec![a, b, c];
-        let names: Vec<&str> = published_in_week(&posts, (2026, 41))
-            .iter()
-            .map(|p| p.slug.as_str())
-            .collect();
-        assert_eq!(names, vec!["a"]);
-        assert_eq!(posts[2].series, vec!["S".to_string()]);
-        assert!(published_in_week(&posts, (2026, 42)).len() == 1);
+        assert_eq!(a.date, NaiveDate::from_ymd_opt(2026, 10, 6));
+        assert!(b.draft);
+        assert_eq!(c.series, vec!["S".to_string()]);
     }
 
     #[test]
-    fn config_parses_with_defaults_and_rejects_nonsense() {
-        let c = Config::parse("repo = \"/srv/x/site\"\nweekday = \"wed\"\nhour = 7\n").unwrap();
-        assert_eq!(c.weekday, Weekday::Wed);
-        assert_eq!(c.hour, 7);
-        assert_eq!(c.max_per_week, 1);
-        assert_eq!(c.queue_repo, PathBuf::from("/srv/lindfors-publisher/services"));
-        assert_eq!(c.queue, PathBuf::from("/srv/lindfors-publisher/services/queue"));
-        let d = Config::parse("queue_repo = \"/srv/q\"\n").unwrap();
-        assert_eq!(d.queue, PathBuf::from("/srv/q/queue"));
+    fn config_parses_with_defaults_and_refuses_the_queue_keys() {
+        let c = Config::parse("repo = \"/srv/x/site\"\n").unwrap();
+        assert_eq!(c.repo, PathBuf::from("/srv/x/site"));
+        assert_eq!(c.assets, PathBuf::from("/srv/lindfors-writing/assets"));
+        assert_eq!(c.receipts, PathBuf::from("/srv/lindfors-publisher/receipts"));
         assert_eq!(
             c.send_command,
             vec!["sudo".to_string(), "/opt/lindfors-newsletter/send-issue".to_string()]
         );
-        assert!(Config::parse("weekday = \"someday\"").is_err());
         assert!(Config::parse("timezone = \"Mars/Olympus\"").is_err());
-        assert!(Config::parse("hour = 25").is_err());
+        assert!(Config::parse("queue_repo = \"/srv/q\"\n").err().unwrap().contains("queue_repo"));
+        assert!(Config::parse("weekday = \"tuesday\"\n").is_err());
     }
 
     #[test]
-    fn sidecar_round_trips_through_entry() {
-        let text = crate::schedule::sidecar(
-            "a-post",
-            "A",
-            "2026-09-03T20:00:00Z",
-            Some("2026-W41"),
-            Some("Subj"),
-            false,
-            true,
-        );
-        let e = Entry::parse(Path::new("/q/a-post"), &text).unwrap();
-        assert_eq!(e.slug, "a-post");
-        assert_eq!(e.week, Some((2026, 41)));
-        assert!(!e.send);
-        assert!(e.twir);
-        assert_eq!(e.subject.as_deref(), Some("Subj"));
-        assert_eq!(e.slot_text(), "2026-W41");
-        // A sidecar from before the key existed is not a submission.
-        let old = crate::schedule::sidecar("b", "B", "2026-09-03T20:00:00Z", None, None, true, false);
-        assert!(!Entry::parse(Path::new("/q/b"), &old).unwrap().twir);
-    }
-    #[test]
-    fn exact_entry_parses_and_never_enters_legacy_selection() {
-        let entry = Entry::parse(
-            Path::new("/queue/test"),
-            "slug = \"test\"\npublish_at = \"2026-09-11T10:00:00+02:00\"\n",
-        )
-        .unwrap();
-        assert_eq!(entry.publish_at.unwrap().to_rfc3339(), "2026-09-11T08:00:00+00:00");
-        assert!(pick(&[entry], (2026, 40)).is_none());
-    }
-    #[test]
-    fn two_scheduling_policies_are_rejected() {
-        assert!(Entry::parse(
-            Path::new("/queue/test"),
-            "slug = \"test\"\nweek = \"2026-W40\"\npublish_at = \"2026-09-11T10:00:00+02:00\"\n"
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn due_exact_entries_override_cadence_but_future_entries_wait() {
-        let now = DateTime::parse_from_rfc3339("2026-09-11T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let mut due = entry("due", "2026-09-01", None);
-        due.publish_at = Some(now - chrono::Duration::minutes(1));
-        let mut future = entry("future", "2026-08-01", None);
-        future.publish_at = Some(now + chrono::Duration::minutes(1));
-        let legacy = entry("legacy", "2026-07-01", None);
-        assert_eq!(
-            pick_due(&[future.clone(), legacy.clone(), due], now, (2026, 37), false)
-                .unwrap()
-                .slug,
-            "due"
-        );
-        assert!(pick_due(&[future.clone(), legacy.clone()], now, (2026, 37), false).is_none());
-        assert_eq!(
-            pick_due(&[future, legacy], now, (2026, 37), true).unwrap().slug,
-            "legacy"
-        );
-    }
-    #[test]
-    fn receipts_are_written_atomically_outside_resettable_clones() {
+    fn receipts_are_written_atomically() {
         let root = std::env::temp_dir().join(format!("publisher-receipt-test-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("test.json");
@@ -1078,17 +1128,21 @@ mod tests {
         assert!(!path.with_extension("tmp").exists());
         fs::remove_dir_all(root).unwrap();
     }
+
     // --- Publication receipt recovery -------------------------------------------------
-    // Everything here runs against throwaway git remotes on disk, a local HTTP server
+    // Everything here runs against a throwaway git remote on disk, a local HTTP server
     // standing in for the deployed site, and a recording script standing in for the
-    // newsletter. No network, no real remote, no mail.
+    // newsletter. No network, no real remote, no mail, no database: recovery reads
+    // receipts and the site clone only.
 
     struct Fixture {
         root: PathBuf,
         config: Config,
         sent_log: PathBuf,
-        port: u16,
         server: Option<std::process::Child>,
+        /// Held for the fixture's life: every fixture serves the same slug on the
+        /// same port range, and one answers another's readiness probe otherwise.
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Drop for Fixture {
@@ -1101,25 +1155,19 @@ mod tests {
         }
     }
 
+    /// One fixture at a time: they share a port range and the fake send's
+    /// FAKE_SEND_STATUS, a process-wide variable.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     impl Fixture {
-        /// Two bare remotes and a clone of each, a receipts directory outside both, and
-        /// a queue holding `slug`.
-        fn new(name: &str, slug: &str) -> Fixture {
+        /// A bare remote and a clone of it, and a receipts directory outside it.
+        fn new(name: &str) -> Fixture {
+            let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
             // No shell metacharacters: the fake send script interpolates this path.
             let root = std::env::temp_dir().join(format!("publisher-recovery-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).unwrap();
             let site = Fixture::repo(&root, "site");
-            let queue_repo = Fixture::repo(&root, "services");
-            fs::create_dir_all(queue_repo.join("queue").join(slug)).unwrap();
-            fs::write(
-                queue_repo.join("queue").join(slug).join("schedule.toml"),
-                format!("slug = \"{slug}\"\n"),
-            )
-            .unwrap();
-            git(&queue_repo, &["add", "-A"]).unwrap();
-            git(&queue_repo, &["commit", "--quiet", "-m", "queue"]).unwrap();
-            git(&queue_repo, &["push", "--quiet", "origin", "HEAD:main"]).unwrap();
             let sent_log = root.join("sent.log");
             let send = root.join("send-issue");
             fs::write(
@@ -1138,13 +1186,10 @@ mod tests {
             fs::create_dir_all(root.join("receipts")).unwrap();
             let config = Config {
                 repo: site,
-                queue: queue_repo.join("queue"),
-                queue_repo,
-                weekday: Weekday::Tue,
-                hour: 8,
-                minute: 0,
+                assets: root.join("assets"),
+                export: root.join("export"),
+                receipts: root.join("receipts"),
                 timezone: chrono_tz::Europe::Oslo,
-                max_per_week: 1,
                 // No listener here, so every URL answers something other than 200.
                 site_url: "http://127.0.0.1:1".into(),
                 send_command: vec![send.to_string_lossy().into_owned()],
@@ -1152,7 +1197,7 @@ mod tests {
                 remote: "origin".into(),
                 branch: "main".into(),
             };
-            Fixture { root, config, sent_log, port: 0, server: None }
+            Fixture { root, config, sent_log, server: None, _serial: serial }
         }
 
         fn repo(root: &Path, name: &str) -> PathBuf {
@@ -1186,7 +1231,6 @@ mod tests {
                     .spawn()
                     .unwrap();
                 self.server = Some(child);
-                self.port = port;
                 self.config.site_url = format!("http://127.0.0.1:{port}");
                 for _ in 0..50 {
                     std::thread::sleep(Duration::from_millis(100));
@@ -1202,7 +1246,7 @@ mod tests {
         }
 
         fn receipt(&self, slug: &str) -> PathBuf {
-            self.root.join("receipts").join(format!("{slug}.json"))
+            self.config.receipts.join(format!("{slug}.json"))
         }
         fn write(&self, slug: &str, value: serde_json::Value) {
             write_receipt(&self.receipt(slug), &value).unwrap();
@@ -1231,39 +1275,11 @@ mod tests {
             git(&self.config.repo, &["push", "--quiet", "origin", "HEAD:main"]).unwrap();
             hash
         }
-        fn guard(&self) -> EnvGuard {
-            EnvGuard::set(self.root.join("receipts"))
-        }
-    }
-
-    /// `receipt_dir` reads a process-wide variable, so these tests take a lock and put
-    /// it back. Tests that share it must not run concurrently.
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
-    }
-    static RECEIPTS_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    impl EnvGuard {
-        fn set(dir: PathBuf) -> EnvGuard {
-            let lock = RECEIPTS_ENV.lock().unwrap_or_else(|e| e.into_inner());
-            let previous = std::env::var_os("WRITING_RECEIPTS");
-            std::env::set_var("WRITING_RECEIPTS", &dir);
-            EnvGuard { _lock: lock, previous }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(v) => std::env::set_var("WRITING_RECEIPTS", v),
-                None => std::env::remove_var("WRITING_RECEIPTS"),
-            }
-        }
     }
 
     #[test]
     fn a_started_send_is_never_repeated_after_a_restart() {
-        let mut f = Fixture::new("resend", "post");
-        let _guard = f.guard();
+        let mut f = Fixture::new("resend");
         let commit = f.land_commit("post");
         f.serve("post");
         // The crash case: the send was started, and whether the mail went out is not
@@ -1271,7 +1287,7 @@ mod tests {
         f.write(
             "post",
             serde_json::json!({"slug":"post","status":"deploying","send":true,"subject":null,
-                               "commit":commit,"queue_removed":true,"mail_started":true}),
+                               "commit":commit,"mail_started":true}),
         );
         recover_receipts(&f.config).unwrap();
         assert_eq!(f.read("post")["status"], "needs attention");
@@ -1285,41 +1301,32 @@ mod tests {
 
     #[test]
     fn recovery_finishes_a_deployment_that_had_not_mailed_yet() {
-        let mut f = Fixture::new("finish", "post");
-        let _guard = f.guard();
+        let mut f = Fixture::new("finish");
         let commit = f.land_commit("post");
         f.serve("post");
         f.write(
             "post",
             serde_json::json!({"slug":"post","status":"deploying","send":true,"subject":"Chosen",
-                               "commit":commit,"queue_removed":false,"mail_started":false}),
+                               "commit":commit,"mail_started":false}),
         );
         recover_receipts(&f.config).unwrap();
         let receipt = f.read("post");
         assert_eq!(receipt["status"], "published");
         assert_eq!(receipt["error"], serde_json::Value::Null);
         assert_eq!(receipt["mail_started"], true);
-        assert_eq!(receipt["queue_removed"], true);
         assert_eq!(f.sends(), vec!["post --subject Chosen".to_string()]);
-        // The queue entry is gone, and the removal was pushed, not just committed.
-        assert!(!f.config.queue.join("post").exists());
-        let remote = f.config.queue_repo.parent().unwrap().join("services.git");
-        let log = Command::new("git").arg("-C").arg(&remote).args(["log", "--oneline"]).output().unwrap();
-        assert!(String::from_utf8_lossy(&log.stdout).contains("Published: post"));
     }
 
     #[test]
     fn a_send_that_fails_is_reported_and_not_retried() {
-        let mut f = Fixture::new("failsend", "post");
-        let _guard = f.guard();
+        let mut f = Fixture::new("failsend");
         let commit = f.land_commit("post");
         f.serve("post");
         f.write(
             "post",
             serde_json::json!({"slug":"post","status":"deploying","send":true,"subject":null,
-                               "commit":commit,"queue_removed":true,"mail_started":false}),
+                               "commit":commit,"mail_started":false}),
         );
-        // The fixture's own variable; these tests hold the receipts lock.
         std::env::set_var("FAKE_SEND_STATUS", "3");
         let result = recover_receipts(&f.config);
         std::env::remove_var("FAKE_SEND_STATUS");
@@ -1332,14 +1339,13 @@ mod tests {
 
     #[test]
     fn a_deployment_that_is_not_up_yet_is_retried_without_mailing() {
-        let f = Fixture::new("waiting", "post");
-        let _guard = f.guard();
+        let f = Fixture::new("waiting");
         let commit = f.land_commit("post");
         // site_url has no listener, so wait_for cannot see 200.
         f.write(
             "post",
             serde_json::json!({"slug":"post","status":"deploying","send":true,"subject":null,
-                               "commit":commit,"queue_removed":true,"mail_started":false}),
+                               "commit":commit,"mail_started":false}),
         );
         assert!(recover_receipts(&f.config).is_err());
         let receipt = f.read("post");
@@ -1350,9 +1356,8 @@ mod tests {
     }
 
     #[test]
-    fn a_receipt_whose_commit_never_landed_is_discarded_and_the_entry_stays_queued() {
-        let f = Fixture::new("unlanded", "post");
-        let _guard = f.guard();
+    fn a_receipt_whose_commit_never_landed_is_discarded_so_the_approval_is_retried() {
+        let f = Fixture::new("unlanded");
         // Committed locally but never pushed, exactly what reset_to_remote throws away.
         fs::write(f.config.repo.join("stray.txt"), "x").unwrap();
         git(&f.config.repo, &["add", "-A"]).unwrap();
@@ -1362,22 +1367,20 @@ mod tests {
         f.write(
             "post",
             serde_json::json!({"slug":"post","status":"publishing","send":true,"subject":null,
-                               "commit":orphan,"queue_removed":false,"mail_started":false}),
+                               "commit":orphan,"mail_started":false}),
         );
         recover_receipts(&f.config).unwrap();
         assert!(!f.receipt("post").exists(), "the receipt must not block a retry");
-        assert!(f.config.queue.join("post").exists(), "the entry is still publishable");
         assert!(f.sends().is_empty());
     }
 
     #[test]
     fn a_receipt_with_no_commit_is_discarded() {
-        let f = Fixture::new("nocommit", "post");
-        let _guard = f.guard();
+        let f = Fixture::new("nocommit");
         f.write(
             "post",
             serde_json::json!({"slug":"post","status":"publishing","send":true,"subject":null,
-                               "commit":null,"queue_removed":false,"mail_started":false}),
+                               "commit":null,"mail_started":false}),
         );
         recover_receipts(&f.config).unwrap();
         assert!(!f.receipt("post").exists());
@@ -1386,15 +1389,14 @@ mod tests {
 
     #[test]
     fn settled_receipts_are_left_alone() {
-        let mut f = Fixture::new("settled", "post");
-        let _guard = f.guard();
+        let mut f = Fixture::new("settled");
         let commit = f.land_commit("post");
         f.serve("post");
         for status in ["published", "needs attention"] {
             f.write(
                 "post",
                 serde_json::json!({"slug":"post","status":status,"send":true,"subject":null,
-                                   "commit":commit,"queue_removed":true,"mail_started":false}),
+                                   "commit":commit,"mail_started":false}),
             );
             recover_receipts(&f.config).unwrap();
             assert_eq!(f.read("post")["status"], status);

@@ -1,32 +1,29 @@
 # The publisher's configuration, at /etc/lindfors-publisher.toml on mail.lindfors.no.
 # Read by `site-tools publish` on every run. Every key has the default shown here.
 #
-# The cadence is here and nowhere else: change the weekday or the hour and every
-# queued post moves with it. A post pins itself to a week with `--week` when it is
-# queued; nothing in a post names a day or an hour.
+# What to publish, and when, is not here: it is the writing desk's confirmed approval,
+# read from its database as the writing_publisher role. The credential is not here
+# either; `publish-locked` puts PUBLISHER_DATABASE_URL in the environment from the
+# host/publisher bundle.
 
 # A clone of the site repo the publisher account can push to, with its own deploy
 # key. The run resets it to the remote branch before doing anything, so nothing kept
 # in it survives except what is ignored (fonts/).
 repo = "/srv/lindfors-publisher/site"
 
-# A clone of the private lindfors-services repo, pushable with a second deploy key.
-# Its `queue/` is the queue: `site-tools schedule` on the workstation puts an entry
-# there and a push queues it. Every run resets this clone to the remote too, and a
-# publish removes the entry with a commit pushed back, so the repo's history is the
-# record of what went out. `queue` defaults to `<queue_repo>/queue`.
-queue_repo = "/srv/lindfors-publisher/services"
+# The desk's content-addressed asset store, readable by the publisher through the
+# writing-queue group; each blob is checked against its hash before it is used.
+assets = "/srv/lindfors-writing/assets"
 
-# The weekly slot. The run every hour does nothing before it, and after it publishes
-# the next queued post unless the week already has one. Weekends are simply not the
-# weekday named here.
-weekday = "tuesday"
-hour = 8
-minute = 0
+# Where a revision is laid out as a page bundle before it moves into the clone.
+export = "/srv/lindfors-publisher/export"
+
+# One JSON per slug the publisher has taken on: the record the desk reads back and a
+# person finishes from. Outside the clone, publisher-owned, readable by the desk.
+receipts = "/srv/lindfors-publisher/receipts"
+
+# The zone the publication date is taken in.
 timezone = "Europe/Oslo"
-
-# Posts allowed to carry a date in one ISO week, counting the ones published by hand.
-max_per_week = 1
 
 # Polled after the push until the page and the issue answer 200; the send waits on it.
 site_url = "https://lindfors.no"

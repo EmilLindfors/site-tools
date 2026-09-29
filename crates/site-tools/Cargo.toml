@@ -18,9 +18,15 @@ cite = ["dep:crossref-client", "dep:tokio"]
 [dependencies]
 toml = "0.8"
 
-# `publish`: ISO weeks, weekdays and the hour in a named time zone. Both pure Rust.
+# `publish`: the instant an approval names, and the day it becomes in Oslo. Both pure Rust.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 chrono-tz = "0.10"
+
+# `publish` reads confirmed approvals out of the writing desk's Postgres on loopback,
+# as a read-only role and without TLS; the sync client over tokio-postgres, pure Rust.
+# sha2 checks each revision and asset against the digest the desk approved.
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+sha2 = "0.10"
 
 # The one citation source that needs the network. A `@key` that is a DOI, or that the
 # post's `[extra.bib]` maps to one, is resolved against crossref; a key with neither is
