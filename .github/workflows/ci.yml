@@ -43,7 +43,7 @@ jobs:
       - name: The publisher against the desk's tables
         env:
           PUBLISHER_TEST_DATABASE_URL: postgres://publisher_test:publisher_test@127.0.0.1:5432/publisher_test
-        run: cargo test -p site-tools publish:: -- --include-ignored
+        run: "cargo test -p site-tools publish:: -- --include-ignored"
 
       - name: Clippy
         run: cargo clippy --all-targets
