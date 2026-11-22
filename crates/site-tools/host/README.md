@@ -145,12 +145,23 @@ and do not need one.
 
 ## Build and copy, from the workstation
 
+From the root of this repo:
+
 ```sh
-./tools/site-tools/build-host.sh
-scp tools/site-tools/target/aarch64-unknown-linux-musl/release/site-tools \
-    tools/site-tools/host/lindfors-publisher.toml \
-    tools/site-tools/host/publish-locked \
+crates/site-tools/build-host.sh
+scp target/aarch64-unknown-linux-musl/release/site-tools \
+    crates/site-tools/host/lindfors-publisher.toml \
+    crates/site-tools/host/publish-locked \
     ../lindfors-services/crates/lindfors-newsletter/send-issue hetzner:/tmp/
+```
+
+On the box, replace the binary under the run's own lock, so the minute's run never
+starts on half of it. BusyBox `flock` has no `-w`; `timeout` bounds the wait:
+
+```sh
+timeout 300 flock /srv/lindfors-publisher/publish.lock sh -ec '
+    install -m 755 /tmp/site-tools /opt/lindfors-publisher/site-tools.new
+    mv /opt/lindfors-publisher/site-tools.new /opt/lindfors-publisher/site-tools'
 ```
 
 `/tmp/lindfors-newsletter` on the box is a directory left from the cutover, so the
