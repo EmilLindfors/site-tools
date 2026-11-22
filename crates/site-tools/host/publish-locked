@@ -1,6 +1,6 @@
 #!/bin/sh
 # The publisher's cron command, from root's crontab once a minute: the desk's
-# read-only database credential from its bundle, the publisher account, and one run
+# database credential from its bundle, the publisher account, and one run
 # at a time. A run that finds the lock held exits at once; a run can wait twenty
 # minutes for the site to come up, and the next minute's tick must not start a second.
 #

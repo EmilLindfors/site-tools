@@ -2,7 +2,8 @@
 # Read by `site-tools publish` on every run. Every key has the default shown here.
 #
 # What to publish, and when, is not here: it is the writing desk's confirmed approval,
-# read from its database as the writing_publisher role. The credential is not here
+# read from its database as the writing_publisher role, which also writes what the
+# publisher did into the desk's writing_publications table. The credential is not here
 # either; `publish-locked` puts PUBLISHER_DATABASE_URL in the environment from the
 # host/publisher bundle.
 
@@ -17,10 +18,6 @@ assets = "/srv/lindfors-writing/assets"
 
 # Where a revision is laid out as a page bundle before it moves into the clone.
 export = "/srv/lindfors-publisher/export"
-
-# One JSON per slug the publisher has taken on: the record the desk reads back and a
-# person finishes from. Outside the clone, publisher-owned, readable by the desk.
-receipts = "/srv/lindfors-publisher/receipts"
 
 # The zone the publication date is taken in.
 timezone = "Europe/Oslo"

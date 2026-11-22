@@ -14,7 +14,8 @@
 //!   there is no weekly slot and no cap, because a time is chosen for every post.
 //! - *Take it on.* Under the article's own advisory lock (the one the desk holds while
 //!   it applies a command), read the article once more, check the approval still
-//!   stands, and write the receipt. From that receipt on the desk refuses to withdraw.
+//!   stands, and insert the article's row in `writing_publications`. From that row on
+//!   the desk refuses to withdraw.
 //! - *The sequence.* Export the revision and its assets into a bundle, reset the site
 //!   clone to its remote branch, move the bundle in, write today's date into its
 //!   frontmatter and drop `draft`, generate the derived files the build would, commit,
@@ -23,15 +24,17 @@
 //!   push mails nobody, and the next run starts from the remote again. A slug the site
 //!   already carries as a dated post is never published twice.
 //!
-//! The receipt is the record. The desk reads it back (`publishing`, `deploying`,
-//! `published`, `needs attention`) and shows it; a run that dies mid-way is finished
-//! by the next one from the receipt, and a newsletter send that may have started is
-//! never repeated without a person.
+//! The row is the record, a receipt as JSON (`publishing`, `deploying`, `published`,
+//! `needs attention`), written as the run goes. The desk follows it into the article's
+//! status; a run that dies mid-way is finished by the next one from the row, and a
+//! newsletter send that may have started is never repeated without a person. Until
+//! 2026-11-22 the receipts were JSON files the desk read from this account's
+//! directory; one table both sides lock and read replaced them.
 //!
 //! `date` is assigned here, not by the author. Series order is the date, so it is
 //! publish order, and two posts in a series can never share one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -45,8 +48,9 @@ use crate::{frontmatter, markdown, newsletter, og, pdf, speech};
 
 const DEFAULT_CONFIG: &str = "/etc/lindfors-publisher.toml";
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
-/// The desk's database, as the `writing_publisher` role. Not in the config file: it
-/// is a credential, and `sec exec host/publisher` puts it in the environment.
+/// The desk's database, as the `writing_publisher` role: reads the articles, writes
+/// `writing_publications`. Not in the config file: it is a credential, and `sec exec
+/// host/publisher` puts it in the environment.
 const DATABASE_ENV: &str = "PUBLISHER_DATABASE_URL";
 
 pub struct Config {
@@ -55,9 +59,6 @@ pub struct Config {
     pub assets: PathBuf,
     /// Where a revision is laid out as a page bundle before it moves into the site.
     pub export: PathBuf,
-    /// One JSON per slug the publisher has taken on. Outside the resettable clone,
-    /// readable by the desk.
-    pub receipts: PathBuf,
     pub timezone: Tz,
     pub site_url: String,
     /// The program that sends an issue, with the slug appended. On the host this is
@@ -95,11 +96,16 @@ impl Config {
                 ));
             }
         }
+        if table.contains_key("receipts") {
+            return Err(
+                "config: `receipts` is gone; what the publisher did is a row in the desk's writing_publications table now, remove it"
+                    .to_string(),
+            );
+        }
         Ok(Config {
             repo: PathBuf::from(s("repo", "/srv/lindfors-publisher/site")),
             assets: PathBuf::from(s("assets", "/srv/lindfors-writing/assets")),
             export: PathBuf::from(s("export", "/srv/lindfors-publisher/export")),
-            receipts: PathBuf::from(s("receipts", "/srv/lindfors-publisher/receipts")),
             timezone,
             site_url: s("site_url", "https://lindfors.no").trim_end_matches('/').to_string(),
             send_command,
@@ -433,9 +439,11 @@ fn read_confirmed(client: &mut postgres::Client) -> Result<(Vec<Entry>, Vec<Stri
 
 /// Take an approval on: under the article's advisory lock, the lock the desk holds
 /// while it applies a command, read the article again, check the approval is the one
-/// that was picked and still confirmed, and write the first receipt. Once the receipt
-/// exists the desk refuses to withdraw, so a withdrawal and a publication cannot cross.
-fn take_on(client: &mut postgres::Client, config: &Config, entry: &Entry) -> Result<PathBuf, String> {
+/// that was picked and still confirmed, and insert the article's row in
+/// `writing_publications`. The desk checks for that row under the same lock before it
+/// lets a withdrawal through, so a withdrawal and a publication cannot cross. Returns
+/// the receipt the row holds.
+fn take_on(client: &mut postgres::Client, entry: &Entry) -> Result<serde_json::Value, String> {
     let mut tx = client.transaction().map_err(|e| e.to_string())?;
     tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))", &[&entry.slug])
         .map_err(|e| format!("locking {}: {e}", entry.slug))?;
@@ -448,17 +456,63 @@ fn take_on(client: &mut postgres::Client, config: &Config, entry: &Entry) -> Res
         .filter(|e| e.token == entry.token && e.revision == entry.revision && e.digest == entry.digest)
         .ok_or_else(|| format!("{}: the approval changed under us; nothing published", entry.slug))?;
     debug_assert_eq!(current.slug, entry.slug);
-    fs::create_dir_all(&config.receipts).map_err(|e| e.to_string())?;
-    let path = config.receipts.join(format!("{}.json", entry.slug));
-    if path.exists() {
-        return Err(format!("{}: a receipt already exists; recovery owns it", entry.slug));
+    let receipt = serde_json::json!({"slug":entry.slug,"approval":entry.token,"revision":entry.revision,"status":"publishing","send":entry.send,"subject":entry.subject,"commit":null,"mail_started":false});
+    let inserted = tx
+        .execute(
+            "INSERT INTO writing_publications (slug, receipt) VALUES ($1, $2) ON CONFLICT (slug) DO NOTHING",
+            &[&entry.slug, &receipt],
+        )
+        .map_err(|e| format!("{}: recording the publication: {e}", entry.slug))?;
+    if inserted != 1 {
+        return Err(format!("{}: a publication record already exists; recovery owns it", entry.slug));
     }
-    write_receipt(
-        &path,
-        &serde_json::json!({"slug":entry.slug,"approval":entry.token,"revision":entry.revision,"status":"publishing","send":entry.send,"subject":entry.subject,"commit":null,"mail_started":false}),
-    )?;
     tx.commit().map_err(|e| e.to_string())?;
-    Ok(path)
+    Ok(receipt)
+}
+
+/// What the publisher has done with each approval it took on: the desk's
+/// `writing_publications`, one row per slug, its receipt as JSON (`slug`, `approval`
+/// as the token, `revision`, `status`, `send`, `subject`, `commit`, `mail_started`,
+/// `error`). `take_on` creates a row under the article's lock; this is everything
+/// after that. A trait so recovery can be tested without a database.
+pub trait Ledger {
+    /// Every row, as `(slug, receipt)`.
+    fn receipts(&mut self) -> Result<Vec<(String, serde_json::Value)>, String>;
+    /// Replace the receipt in a row the publisher took. A row that is gone stops the
+    /// run before anything else happens: a person removed it, and from then on the
+    /// publication is theirs.
+    fn record(&mut self, slug: &str, receipt: &serde_json::Value) -> Result<(), String>;
+    /// Drop the row of a run that pushed nothing, so the approval is picked up again
+    /// as if untouched, and can be withdrawn again.
+    fn discard(&mut self, slug: &str) -> Result<(), String>;
+}
+
+impl Ledger for postgres::Client {
+    fn receipts(&mut self) -> Result<Vec<(String, serde_json::Value)>, String> {
+        Ok(self
+            .query("SELECT slug, receipt FROM writing_publications ORDER BY slug", &[])
+            .map_err(|e| format!("reading publication records: {e}"))?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect())
+    }
+    fn record(&mut self, slug: &str, receipt: &serde_json::Value) -> Result<(), String> {
+        let updated = self
+            .execute(
+                "UPDATE writing_publications SET receipt = $2, updated_at = now() WHERE slug = $1",
+                &[&slug, receipt],
+            )
+            .map_err(|e| format!("{slug}: recording the publication: {e}"))?;
+        if updated != 1 {
+            return Err(format!("{slug}: the publication record is gone; a person removed it, so this run stops"));
+        }
+        Ok(())
+    }
+    fn discard(&mut self, slug: &str) -> Result<(), String> {
+        self.execute("DELETE FROM writing_publications WHERE slug = $1", &[&slug])
+            .map(|_| ())
+            .map_err(|e| format!("{slug}: discarding the publication record: {e}"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,24 +557,26 @@ fn print_usage() {
     eprintln!("Subcommands:");
     eprintln!("  run [--dry-run]   Finish any publication in progress, then publish the earliest due approval");
     eprintln!("  next              What `run` would do, changing nothing");
-    eprintln!("  list              Every confirmed approval, with its time and its receipt");
+    eprintln!("  list              Every confirmed approval, with its time and its publication record");
     eprintln!("  check <index.md>  The pre-flight refusals, for the writing desk's validation");
     eprintln!();
     eprintln!("  --config <path>   Default {DEFAULT_CONFIG}");
     eprintln!("  {DATABASE_ENV}    The desk's database, as the writing_publisher role (from the host/publisher bundle)");
     eprintln!();
     eprintln!("A post is confirmed in the writing desk, not here. Withdraw it there too, before this");
-    eprintln!("has taken it on; afterwards its receipt is the record and a person finishes it.");
+    eprintln!("has taken it on; afterwards its row in writing_publications is the record and a");
+    eprintln!("person finishes it.");
 }
 
 fn list(config: &Config) -> Result<(), String> {
     let mut client = connect()?;
     let (entries, skipped) = read_confirmed(&mut client)?;
+    let records: BTreeMap<String, serde_json::Value> = client.receipts()?.into_iter().collect();
     if entries.is_empty() && skipped.is_empty() {
         println!("No confirmed approvals.");
     }
     for e in &entries {
-        let receipt = read_receipt(&config.receipts.join(format!("{}.json", e.slug)));
+        let receipt = records.get(&e.slug);
         println!(
             "  {:<40} {}  revision {:<3} {}  {}  {}",
             e.slug,
@@ -529,8 +585,7 @@ fn list(config: &Config) -> Result<(), String> {
             if e.send { "newsletter" } else { "no mail   " },
             if e.twir { "twir" } else { "    " },
             receipt
-                .as_ref()
-                .and_then(|r| r["status"].as_str().map(|s| format!("receipt: {s}")))
+                .and_then(|r| r["status"].as_str().map(|s| format!("record: {s}")))
                 .unwrap_or_else(|| "waiting".into())
         );
     }
@@ -549,23 +604,26 @@ fn publish(config: &Config, dry: bool) -> Result<(), String> {
         // The clone is a robot's. Whatever it holds, the run starts from the branch it
         // is going to push to.
         reset_to_remote(config, &config.repo)?;
-        recover_receipts(config)?;
     }
     let mut client = connect()?;
+    if !dry {
+        recover(config, &mut client)?;
+    }
     let (mut entries, skipped) = read_confirmed(&mut client)?;
     for reason in &skipped {
         println!("skipped: {reason}");
     }
     let posts = read_posts(&config.repo)?;
+    let taken: BTreeSet<String> = client.receipts()?.into_iter().map(|(slug, _)| slug).collect();
     // Out already, whatever the desk says, or already taken on by an earlier run
-    // whose receipt recovery owns. Never twice.
+    // whose record recovery owns. Never twice.
     entries.retain(|e| {
         if posts.iter().any(|p| p.slug == e.slug && !p.draft && p.date.is_some()) {
             println!("{}: already published on the site; withdraw it in the desk", e.slug);
             return false;
         }
-        if config.receipts.join(format!("{}.json", e.slug)).exists() {
-            println!("{}: has a receipt; recovery owns it", e.slug);
+        if taken.contains(&e.slug) {
+            println!("{}: has a publication record; recovery owns it", e.slug);
             return false;
         }
         true
@@ -601,16 +659,17 @@ fn publish(config: &Config, dry: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let receipt_path = take_on(&mut client, config, entry)?;
-    drop(client);
-    let mut receipt = read_receipt(&receipt_path).ok_or("the receipt just written cannot be read")?;
+    // From here the connection stays open to the end of the run: every step writes the
+    // row. A write that fails stops the run where it is, and the next run's recovery
+    // takes it from the row as it was last written.
+    let mut receipt = take_on(&mut client, entry)?;
     let mut entry = entry.clone();
     if let Err(e) = entry.export(&config.assets, &config.export) {
-        // Nothing has moved. The receipt says why, and stays, so a person looks: an
+        // Nothing has moved. The record says why, and stays, so a person looks: an
         // asset that does not match its hash is not something the next run fixes.
         receipt["status"] = serde_json::json!("needs attention");
         receipt["error"] = serde_json::json!(e);
-        write_receipt(&receipt_path, &receipt)?;
+        client.record(&entry.slug, &receipt)?;
         return Err(e);
     }
 
@@ -638,7 +697,7 @@ fn publish(config: &Config, dry: bool) -> Result<(), String> {
             );
             receipt["status"] = serde_json::json!("needs attention");
             receipt["error"] = serde_json::json!(e);
-            write_receipt(&receipt_path, &receipt)?;
+            client.record(&entry.slug, &receipt)?;
             return Err(e);
         }
     }
@@ -662,8 +721,9 @@ fn publish(config: &Config, dry: bool) -> Result<(), String> {
             }
         });
     if let Err(e) = derived {
-        // Nothing pushed: the receipt goes, so the next run tries again from the desk.
-        let _ = fs::remove_file(&receipt_path);
+        // Nothing pushed: the record goes, so the next run tries again from the desk.
+        // A discard that fails leaves a row with no commit, which recovery drops.
+        let _ = client.discard(&entry.slug);
         return Err(e);
     }
 
@@ -673,7 +733,7 @@ fn publish(config: &Config, dry: bool) -> Result<(), String> {
     git(&config.repo, &["commit", "--quiet", "-m", &message])?;
     let hash = git(&config.repo, &["rev-parse", "--short", "HEAD"])?;
     receipt["commit"] = serde_json::json!(git(&config.repo, &["rev-parse", "HEAD"])?.trim());
-    write_receipt(&receipt_path, &receipt)?;
+    client.record(&entry.slug, &receipt)?;
     git(
         &config.repo,
         &["push", "--quiet", &config.remote, &format!("HEAD:{}", config.branch)],
@@ -681,36 +741,15 @@ fn publish(config: &Config, dry: bool) -> Result<(), String> {
     println!("pushed {} as {}", entry.slug, hash.trim());
     let _ = fs::remove_dir_all(&entry.dir);
 
-    receipt["status"] = serde_json::json!("deploying");
-    write_receipt(&receipt_path, &receipt)?;
-    finish_receipt(config, &receipt_path, &mut receipt)
+    finish(config, &mut client, &mut receipt)
 }
 
-fn read_receipt(path: &Path) -> Option<serde_json::Value> {
-    fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok())
-}
-fn write_receipt(path: &Path, value: &serde_json::Value) -> Result<(), String> {
-    use std::io::Write;
-    let temp = path.with_extension("tmp");
-    let mut file = fs::File::create(&temp).map_err(|e| e.to_string())?;
-    file.write_all(
-        serde_json::to_string_pretty(value)
-            .map_err(|e| e.to_string())?
-            .as_bytes(),
-    )
-    .map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
-    fs::rename(&temp, path).map_err(|e| e.to_string())?;
-    fs::File::open(path.parent().unwrap_or(Path::new(".")))
-        .and_then(|f| f.sync_all())
-        .map_err(|e| e.to_string())
-}
-/// From a pushed commit to a settled receipt: wait for the site, then mail once. A
+/// From a pushed commit to a settled record: wait for the site, then mail once. A
 /// send that may have started is handed to a person, never repeated.
-fn finish_receipt(config: &Config, path: &Path, receipt: &mut serde_json::Value) -> Result<(), String> {
+fn finish(config: &Config, ledger: &mut dyn Ledger, receipt: &mut serde_json::Value) -> Result<(), String> {
     let slug = receipt["slug"].as_str().ok_or("receipt missing slug")?.to_string();
     receipt["status"] = serde_json::json!("deploying");
-    write_receipt(path, receipt)?;
+    ledger.record(&slug, receipt)?;
     let page = format!("{}/blog/{slug}/", config.site_url);
     let issue = format!("{}/newsletter/{slug}.md", config.site_url);
     let urls: Vec<&str> = if receipt["send"] == true {
@@ -720,18 +759,19 @@ fn finish_receipt(config: &Config, path: &Path, receipt: &mut serde_json::Value)
     };
     if let Err(error) = wait_for(&urls, config.wait_minutes) {
         receipt["error"] = serde_json::json!(error);
-        write_receipt(path, receipt)?;
+        ledger.record(&slug, receipt)?;
         return Err(format!("{slug}: deployment not ready; next run will check again"));
     }
     if receipt["send"] == true {
         if receipt["mail_started"] == true {
             receipt["status"] = serde_json::json!("needs attention");
             receipt["error"]=serde_json::json!("Newsletter delivery is uncertain. Inspect the newsletter delivery records before recovery; no automatic resend.");
-            write_receipt(path, receipt)?;
+            ledger.record(&slug, receipt)?;
             return Ok(());
         }
+        // Recorded before the send starts: if this write fails, nothing is sent.
         receipt["mail_started"] = serde_json::json!(true);
-        write_receipt(path, receipt)?;
+        ledger.record(&slug, receipt)?;
         let mut send = Command::new(&config.send_command[0]);
         send.args(&config.send_command[1..]).arg(&slug);
         if let Some(subject) = receipt["subject"].as_str().filter(|s| !s.is_empty()) {
@@ -744,51 +784,44 @@ fn finish_receipt(config: &Config, path: &Path, receipt: &mut serde_json::Value)
                 receipt["error"] = serde_json::json!(format!(
                     "Newsletter failed or uncertain: {result:?}. Inspect delivery records before retrying."
                 ));
-                write_receipt(path, receipt)?;
+                ledger.record(&slug, receipt)?;
                 return Ok(());
             }
         }
     }
     receipt["status"] = serde_json::json!("published");
     receipt["error"] = serde_json::Value::Null;
-    write_receipt(path, receipt)
+    ledger.record(&slug, receipt)
 }
-/// Receipts a previous run left unfinished. One whose commit reached the remote is
+
+/// Records a previous run left unfinished. One whose commit reached the remote is
 /// finished from where it stopped; one whose commit never landed, or that has no
 /// commit, is discarded, so the approval is picked up again as if untouched. Settled
-/// receipts (`published`, `needs attention`) are left for a person.
-fn recover_receipts(config: &Config) -> Result<(), String> {
-    let dir = &config.receipts;
-    if !dir.exists() {
-        return Ok(());
-    }
-    for path in fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let path = path.map_err(|e| e.to_string())?.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+/// records (`published`, `needs attention`) are left for a person.
+fn recover(config: &Config, ledger: &mut dyn Ledger) -> Result<(), String> {
+    for (slug, mut receipt) in ledger.receipts()? {
+        if matches!(receipt["status"].as_str(), Some("published" | "needs attention")) {
             continue;
         }
-        let mut value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        if matches!(value["status"].as_str(), Some("published" | "needs attention")) {
-            continue;
-        }
-        let commit = value["commit"].as_str().unwrap_or("");
+        let commit = receipt["commit"].as_str().unwrap_or("").to_string();
         if commit.is_empty() {
-            fs::remove_file(path).map_err(|e| e.to_string())?;
+            ledger.discard(&slug)?;
             continue;
         }
         let reached = Command::new("git")
             .arg("-C")
             .arg(&config.repo)
-            .args(["merge-base", "--is-ancestor", commit, "HEAD"])
+            .args(["merge-base", "--is-ancestor", &commit, "HEAD"])
             .status()
             .map_err(|e| e.to_string())?
             .success();
         if !reached {
-            fs::remove_file(path).map_err(|e| e.to_string())?;
+            ledger.discard(&slug)?;
             continue;
         }
-        finish_receipt(config, &path, &mut value)?;
+        // The row's key is the record's name, whatever the JSON says.
+        receipt["slug"] = serde_json::json!(slug);
+        finish(config, ledger, &mut receipt)?;
     }
     Ok(())
 }
@@ -1106,7 +1139,6 @@ mod tests {
         let c = Config::parse("repo = \"/srv/x/site\"\n").unwrap();
         assert_eq!(c.repo, PathBuf::from("/srv/x/site"));
         assert_eq!(c.assets, PathBuf::from("/srv/lindfors-writing/assets"));
-        assert_eq!(c.receipts, PathBuf::from("/srv/lindfors-publisher/receipts"));
         assert_eq!(
             c.send_command,
             vec!["sudo".to_string(), "/opt/lindfors-newsletter/send-issue".to_string()]
@@ -1114,30 +1146,135 @@ mod tests {
         assert!(Config::parse("timezone = \"Mars/Olympus\"").is_err());
         assert!(Config::parse("queue_repo = \"/srv/q\"\n").err().unwrap().contains("queue_repo"));
         assert!(Config::parse("weekday = \"tuesday\"\n").is_err());
+        // The receipt directory went with the files; a config that still names it is
+        // one written for the old publisher.
+        assert!(Config::parse("receipts = \"/srv/r\"\n").err().unwrap().contains("writing_publications"));
+    }
+
+    // --- The desk's tables --------------------------------------------------------------
+    // Against a real Postgres: PUBLISHER_TEST_DATABASE_URL names an isolated database the
+    // tests may create tables in. The two tables mirror the ones lindfors-services'
+    // crates/lindfors-writing/schema.sql owns; the columns used here must stay as they
+    // are there.
+
+    fn test_database() -> postgres::Client {
+        let url = std::env::var("PUBLISHER_TEST_DATABASE_URL").expect("an isolated PUBLISHER_TEST_DATABASE_URL");
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        // Two `CREATE TABLE IF NOT EXISTS` at once fail on pg_type instead of waiting.
+        let mut tx = client.transaction().unwrap();
+        tx.batch_execute(
+            "SELECT pg_advisory_xact_lock(831099);
+             CREATE TABLE IF NOT EXISTS writing_articles (
+                 id text PRIMARY KEY, version bigint NOT NULL DEFAULT 0,
+                 document jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());
+             CREATE TABLE IF NOT EXISTS writing_publications (
+                 slug text PRIMARY KEY, receipt jsonb NOT NULL,
+                 updated_at timestamptz NOT NULL DEFAULT now());",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        client
+    }
+
+    /// A confirmed article of its own, and no record for it yet.
+    fn confirmed_article(db: &mut postgres::Client, name: &str) -> (String, serde_json::Value) {
+        let slug = format!("publisher-test-{name}-{}", std::process::id());
+        let doc = article(&slug, DRAFT, BTreeMap::new());
+        db.execute("DELETE FROM writing_publications WHERE slug = $1", &[&slug]).unwrap();
+        db.execute(
+            "INSERT INTO writing_articles (id, document) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET document = $2",
+            &[&slug, &doc],
+        )
+        .unwrap();
+        (slug, doc)
+    }
+
+    fn row(db: &mut postgres::Client, slug: &str) -> Option<serde_json::Value> {
+        db.receipts().unwrap().into_iter().find(|(s, _)| s == slug).map(|(_, r)| r)
     }
 
     #[test]
-    fn receipts_are_written_atomically() {
-        let root = std::env::temp_dir().join(format!("publisher-receipt-test-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let path = root.join("test.json");
-        write_receipt(&path, &serde_json::json!({"status":"deploying","commit":"abc"})).unwrap();
-        write_receipt(&path, &serde_json::json!({"status":"published","commit":"abc"})).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(value["status"], "published");
-        assert!(!path.with_extension("tmp").exists());
-        fs::remove_dir_all(root).unwrap();
+    #[ignore = "requires an isolated PUBLISHER_TEST_DATABASE_URL"]
+    fn taking_an_approval_on_is_a_row_the_desk_can_see() {
+        let mut db = test_database();
+        let (slug, doc) = confirmed_article(&mut db, "record");
+        let entry = Entry::from_article(&doc).unwrap().unwrap();
+
+        let receipt = take_on(&mut db, &entry).unwrap();
+        assert_eq!(receipt["status"], "publishing");
+        assert_eq!(receipt["approval"], "tok");
+        assert_eq!(receipt["revision"], 2);
+        assert_eq!(row(&mut db, &slug), Some(receipt.clone()));
+        // Never twice: the row is there for the next run to find.
+        assert!(take_on(&mut db, &entry).unwrap_err().contains("already exists"));
+
+        let mut deploying = receipt.clone();
+        deploying["status"] = serde_json::json!("deploying");
+        db.record(&slug, &deploying).unwrap();
+        assert_eq!(row(&mut db, &slug).unwrap()["status"], "deploying");
+
+        db.discard(&slug).unwrap();
+        assert_eq!(row(&mut db, &slug), None);
+        // A row a person removed is not written back: the run stops.
+        assert!(db.record(&slug, &deploying).unwrap_err().contains("gone"));
     }
 
-    // --- Publication receipt recovery -------------------------------------------------
+    /// The race the article lock settles: the desk holds the lock while it withdraws,
+    /// the publisher's take-on waits for it, then reads the article as the desk left
+    /// it and refuses. No row is written.
+    #[test]
+    #[ignore = "requires an isolated PUBLISHER_TEST_DATABASE_URL"]
+    fn a_withdrawal_holding_the_lock_wins_over_a_take_on_waiting_for_it() {
+        let mut db = test_database();
+        let (slug, doc) = confirmed_article(&mut db, "race");
+        let entry = Entry::from_article(&doc).unwrap().unwrap();
+
+        let mut desk = test_database();
+        let mut tx = desk.transaction().unwrap();
+        tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))", &[&slug])
+            .unwrap();
+        let publisher = std::thread::spawn(move || take_on(&mut test_database(), &entry));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!publisher.is_finished(), "take_on must wait for the article's lock");
+
+        let mut withdrawn = doc.clone();
+        withdrawn["approval"] = serde_json::Value::Null;
+        withdrawn["status"] = serde_json::json!("review");
+        tx.execute("UPDATE writing_articles SET document = $2 WHERE id = $1", &[&slug, &withdrawn])
+            .unwrap();
+        tx.commit().unwrap();
+
+        let refused = publisher.join().unwrap().unwrap_err();
+        assert!(refused.contains("changed under us"), "{refused}");
+        assert_eq!(row(&mut db, &slug), None);
+    }
+
+    // --- Recovery -----------------------------------------------------------------------
     // Everything here runs against a throwaway git remote on disk, a local HTTP server
-    // standing in for the deployed site, and a recording script standing in for the
-    // newsletter. No network, no real remote, no mail, no database: recovery reads
-    // receipts and the site clone only.
+    // standing in for the deployed site, a recording script standing in for the
+    // newsletter, and a map standing in for writing_publications. No network, no real
+    // remote, no mail, no database: recovery reads the records and the site clone only.
+
+    /// The table, as recovery sees it.
+    impl Ledger for BTreeMap<String, serde_json::Value> {
+        fn receipts(&mut self) -> Result<Vec<(String, serde_json::Value)>, String> {
+            Ok(self.iter().map(|(slug, r)| (slug.clone(), r.clone())).collect())
+        }
+        fn record(&mut self, slug: &str, receipt: &serde_json::Value) -> Result<(), String> {
+            let row = self.get_mut(slug).ok_or(format!("{slug}: the publication record is gone"))?;
+            *row = receipt.clone();
+            Ok(())
+        }
+        fn discard(&mut self, slug: &str) -> Result<(), String> {
+            self.remove(slug);
+            Ok(())
+        }
+    }
 
     struct Fixture {
         root: PathBuf,
         config: Config,
+        ledger: BTreeMap<String, serde_json::Value>,
         sent_log: PathBuf,
         server: Option<std::process::Child>,
         /// Held for the fixture's life: every fixture serves the same slug on the
@@ -1160,7 +1297,7 @@ mod tests {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl Fixture {
-        /// A bare remote and a clone of it, and a receipts directory outside it.
+        /// A bare remote and a clone of it, and no records.
         fn new(name: &str) -> Fixture {
             let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
             // No shell metacharacters: the fake send script interpolates this path.
@@ -1183,12 +1320,10 @@ mod tests {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&send, fs::Permissions::from_mode(0o755)).unwrap();
             }
-            fs::create_dir_all(root.join("receipts")).unwrap();
             let config = Config {
                 repo: site,
                 assets: root.join("assets"),
                 export: root.join("export"),
-                receipts: root.join("receipts"),
                 timezone: chrono_tz::Europe::Oslo,
                 // No listener here, so every URL answers something other than 200.
                 site_url: "http://127.0.0.1:1".into(),
@@ -1197,7 +1332,7 @@ mod tests {
                 remote: "origin".into(),
                 branch: "main".into(),
             };
-            Fixture { root, config, sent_log, server: None, _serial: serial }
+            Fixture { root, config, ledger: BTreeMap::new(), sent_log, server: None, _serial: serial }
         }
 
         fn repo(root: &Path, name: &str) -> PathBuf {
@@ -1245,14 +1380,14 @@ mod tests {
             panic!("no local port answered");
         }
 
-        fn receipt(&self, slug: &str) -> PathBuf {
-            self.config.receipts.join(format!("{slug}.json"))
-        }
-        fn write(&self, slug: &str, value: serde_json::Value) {
-            write_receipt(&self.receipt(slug), &value).unwrap();
+        fn write(&mut self, slug: &str, value: serde_json::Value) {
+            self.ledger.insert(slug.to_string(), value);
         }
         fn read(&self, slug: &str) -> serde_json::Value {
-            serde_json::from_str(&fs::read_to_string(self.receipt(slug)).unwrap()).unwrap()
+            self.ledger[slug].clone()
+        }
+        fn recover(&mut self) -> Result<(), String> {
+            recover(&self.config, &mut self.ledger)
         }
         fn sends(&self) -> Vec<String> {
             fs::read_to_string(&self.sent_log)
@@ -1289,12 +1424,12 @@ mod tests {
             serde_json::json!({"slug":"post","status":"deploying","send":true,"subject":null,
                                "commit":commit,"mail_started":true}),
         );
-        recover_receipts(&f.config).unwrap();
+        f.recover().unwrap();
         assert_eq!(f.read("post")["status"], "needs attention");
         assert!(f.read("post")["error"].as_str().unwrap().contains("uncertain"));
         assert!(f.sends().is_empty(), "recovery must not resend: {:?}", f.sends());
         // And a second run leaves the terminal state alone.
-        recover_receipts(&f.config).unwrap();
+        f.recover().unwrap();
         assert_eq!(f.read("post")["status"], "needs attention");
         assert!(f.sends().is_empty());
     }
@@ -1309,7 +1444,7 @@ mod tests {
             serde_json::json!({"slug":"post","status":"deploying","send":true,"subject":"Chosen",
                                "commit":commit,"mail_started":false}),
         );
-        recover_receipts(&f.config).unwrap();
+        f.recover().unwrap();
         let receipt = f.read("post");
         assert_eq!(receipt["status"], "published");
         assert_eq!(receipt["error"], serde_json::Value::Null);
@@ -1328,18 +1463,18 @@ mod tests {
                                "commit":commit,"mail_started":false}),
         );
         std::env::set_var("FAKE_SEND_STATUS", "3");
-        let result = recover_receipts(&f.config);
+        let result = f.recover();
         std::env::remove_var("FAKE_SEND_STATUS");
         result.unwrap();
         assert_eq!(f.read("post")["status"], "needs attention");
         assert_eq!(f.sends().len(), 1);
-        recover_receipts(&f.config).unwrap();
+        f.recover().unwrap();
         assert_eq!(f.sends().len(), 1, "a failed send is never repeated automatically");
     }
 
     #[test]
     fn a_deployment_that_is_not_up_yet_is_retried_without_mailing() {
-        let f = Fixture::new("waiting");
+        let mut f = Fixture::new("waiting");
         let commit = f.land_commit("post");
         // site_url has no listener, so wait_for cannot see 200.
         f.write(
@@ -1347,7 +1482,7 @@ mod tests {
             serde_json::json!({"slug":"post","status":"deploying","send":true,"subject":null,
                                "commit":commit,"mail_started":false}),
         );
-        assert!(recover_receipts(&f.config).is_err());
+        assert!(f.recover().is_err());
         let receipt = f.read("post");
         assert_eq!(receipt["status"], "deploying", "still recoverable");
         assert_eq!(receipt["mail_started"], false);
@@ -1356,8 +1491,8 @@ mod tests {
     }
 
     #[test]
-    fn a_receipt_whose_commit_never_landed_is_discarded_so_the_approval_is_retried() {
-        let f = Fixture::new("unlanded");
+    fn a_record_whose_commit_never_landed_is_discarded_so_the_approval_is_retried() {
+        let mut f = Fixture::new("unlanded");
         // Committed locally but never pushed, exactly what reset_to_remote throws away.
         fs::write(f.config.repo.join("stray.txt"), "x").unwrap();
         git(&f.config.repo, &["add", "-A"]).unwrap();
@@ -1369,26 +1504,26 @@ mod tests {
             serde_json::json!({"slug":"post","status":"publishing","send":true,"subject":null,
                                "commit":orphan,"mail_started":false}),
         );
-        recover_receipts(&f.config).unwrap();
-        assert!(!f.receipt("post").exists(), "the receipt must not block a retry");
+        f.recover().unwrap();
+        assert!(!f.ledger.contains_key("post"), "the record must not block a retry");
         assert!(f.sends().is_empty());
     }
 
     #[test]
-    fn a_receipt_with_no_commit_is_discarded() {
-        let f = Fixture::new("nocommit");
+    fn a_record_with_no_commit_is_discarded() {
+        let mut f = Fixture::new("nocommit");
         f.write(
             "post",
             serde_json::json!({"slug":"post","status":"publishing","send":true,"subject":null,
                                "commit":null,"mail_started":false}),
         );
-        recover_receipts(&f.config).unwrap();
-        assert!(!f.receipt("post").exists());
+        f.recover().unwrap();
+        assert!(!f.ledger.contains_key("post"));
         assert!(f.sends().is_empty());
     }
 
     #[test]
-    fn settled_receipts_are_left_alone() {
+    fn settled_records_are_left_alone() {
         let mut f = Fixture::new("settled");
         let commit = f.land_commit("post");
         f.serve("post");
@@ -1398,9 +1533,9 @@ mod tests {
                 serde_json::json!({"slug":"post","status":status,"send":true,"subject":null,
                                    "commit":commit,"mail_started":false}),
             );
-            recover_receipts(&f.config).unwrap();
+            f.recover().unwrap();
             assert_eq!(f.read("post")["status"], status);
-            assert!(f.sends().is_empty(), "a settled receipt never mails");
+            assert!(f.sends().is_empty(), "a settled record never mails");
         }
     }
 }
